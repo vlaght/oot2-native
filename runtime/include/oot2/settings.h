@@ -115,8 +115,16 @@ typedef enum RtSettingSource {
       "the width in pixels of the window in windowed mode; resizing the window changes it, and it is remembered")      \
     X(window_height, DISPLAY, INT, LIVE, 720, 180, 16384, NULL,                                                        \
       "the height in pixels of the window in windowed mode; resizing the window changes it, and it is remembered")     \
+    X(astc_bc7, GRAPHICS, BOOL, RESTART, 1, 0, 1, NULL,                                                                \
+      "an ASTC texture the device does not sample is kept as BC7 blocks (encoded from the decoded texels) instead of RGBA8 "   \
+      "texels: a quarter of the memory for a small loss of detail (on by default); 0 keeps RGBA8")                                     \
     X(overlay, DISPLAY, BOOL, LIVE, 0, 0, 1, NULL,                                                                     \
       "the frame-time readout drawn over the picture; the Test preset turns it on")                                    \
+    X(upscaler, DISPLAY, ENUM, LIVE, 1, 0, 0, "bilinear|sharp",                                                        \
+      "how the picture is enlarged to a window larger than it: bilinear, the plain filter of the blit; sharp, a bicubic "  \
+      "enlargement with contrast-adaptive sharpening (spatial: it adds no detail the game did not draw)")             \
+    X(upscale_sharpness, DISPLAY, INT, LIVE, 50, 0, 100, NULL,                                                         \
+      "how much the sharp upscaler sharpens, 0 to 100; 0 is the bicubic enlargement alone")                           \
     X(audio_sink, AUDIO, ENUM, RESTART, 0, 0, 0, "auto|null|capture|sdl3",                                            \
       "where the mixed audio goes: auto is the audio device when this build has one, else null; null has no sound and " \
       "drains on the renderer's clock; capture writes audio-capture.wav in the game folder; sdl3 needs the device")    \

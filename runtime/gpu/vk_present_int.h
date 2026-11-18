@@ -26,3 +26,13 @@ void vko_record(VkCommandBuffer cmd, uint64_t value, int frame, VkImageView view
                 const UiDrawData *dd);
 // 1 when textures wait for a submission to carry their pixels.
 int vko_uploads_waiting(void);
+
+// The picture scaler (vk_scale.c): a bicubic enlargement with contrast-adaptive sharpening, for a window larger than the
+// game's picture. vks_init makes its pipeline for the swapchain's format; 1, or 0 where the program or the device lacks what
+// it needs (the plain blit is used then).
+int vks_init(VkFormat color_format);
+void vks_close(void);
+// Draw src (the snapshot, in GENERAL, src_w x src_h) into the rectangle x, y, w, h of dst (the swapchain image's view, in
+// COLOR_ATTACHMENT_OPTIMAL, of the given extent), keeping what is outside it. sharp is 0 to 1.
+void vks_record(VkCommandBuffer cmd, VkImageView src, uint32_t src_w, uint32_t src_h, VkImageView dst, VkExtent2D extent,
+                int x, int y, int w, int h, float sharp);

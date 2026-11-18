@@ -27,6 +27,7 @@
 #include "oot2/gpu.h"
 #include "oot2/gpu_vk.h"
 #include "oot2/runtime.h"
+#include "oot2/settings.h"
 #include "oot2/vk_image.h"
 #include "oot2/vk_present.h"
 #include "oot2/vsync.h"
@@ -49,6 +50,7 @@ enum { SLOT_FREE, SLOT_FILLING, SLOT_FILLED, SLOT_BUSY, SLOT_HELD };
 typedef struct {
     VkImage image;
     VkDeviceMemory mem;
+    VkImageView view;      // of the image, for the scaler to sample
     uint32_t w, h;
     int state;
     uint64_t seq, value;   // the picture's number; the value of the snapshot's submission
@@ -96,6 +98,7 @@ static uint64_t g_seq_fallback;
 static _Thread_local uint64_t t_pace_seq;  // present_pace's seq, for the present() of the same call on the same thread
 
 static Sc g_sc;
+static int g_scale_on;   // the scaler's pipeline exists (vks_init)
 static Frame g_frames[FRAMES];
 static uint64_t g_last_value;              // the present thread's newest submission
 static uint64_t g_frame_no;
@@ -268,10 +271,11 @@ static uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
     return UINT32_MAX;
 }
 
-typedef struct { VkImage image; VkDeviceMemory mem; } OldImage;
+typedef struct { VkImage image; VkDeviceMemory mem; VkImageView view; } OldImage;
 static void old_image_gone(void *arg, uint64_t value) {
     (void)value;
     OldImage *o = arg;
+    vkDestroyImageView(gpu_vk.device, o->view, NULL);
     vkDestroyImage(gpu_vk.device, o->image, NULL);
     vkFreeMemory(gpu_vk.device, o->mem, NULL);
     free(o);
@@ -280,9 +284,10 @@ static void old_image_gone(void *arg, uint64_t value) {
 static void slot_image_drop(Slot *s) {
     if (!s->image) return;
     gpu_sync_wait(s->last_use, UINT64_MAX);   // the submissions that read or wrote it are done
+    vkDestroyImageView(gpu_vk.device, s->view, NULL);
     vkDestroyImage(gpu_vk.device, s->image, NULL);
     vkFreeMemory(gpu_vk.device, s->mem, NULL);
-    s->image = VK_NULL_HANDLE, s->mem = VK_NULL_HANDLE, s->w = s->h = 0;
+    s->image = VK_NULL_HANDLE, s->mem = VK_NULL_HANDLE, s->view = VK_NULL_HANDLE, s->w = s->h = 0;
 }
 
 // An image of w x h in the slot (the slot is the caller's: FILLING; a submission is open); 1 when it is new and in the
@@ -292,14 +297,15 @@ static int slot_image(Slot *s, uint32_t w, uint32_t h) {
     if (s->image) {
         OldImage *o = malloc(sizeof *o);
         if (!o) rt_fatal("gfx: vulkan: out of memory for an old present snapshot");
-        *o = (OldImage){s->image, s->mem};
+        *o = (OldImage){s->image, s->mem, s->view};
         gpu_vk_effect(old_image_gone, o);
-        s->image = VK_NULL_HANDLE, s->mem = VK_NULL_HANDLE, s->w = s->h = 0;
+        s->image = VK_NULL_HANDLE, s->mem = VK_NULL_HANDLE, s->view = VK_NULL_HANDLE, s->w = s->h = 0;
     }
     VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
                             .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
                             .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
-                            .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                            .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                             VK_IMAGE_USAGE_SAMPLED_BIT,
                             .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
     GPU_VK_OK(vkCreateImage(gpu_vk.device, &ci, NULL, &s->image), "vkCreateImage (a present snapshot)");
     VkMemoryRequirements mr;
@@ -310,6 +316,10 @@ static int slot_image(Slot *s, uint32_t w, uint32_t h) {
                                   .memoryTypeIndex = type};
     GPU_VK_OK(vkAllocateMemory(gpu_vk.device, &alloc, NULL, &s->mem), "vkAllocateMemory (a present snapshot)");
     GPU_VK_OK(vkBindImageMemory(gpu_vk.device, s->image, s->mem, 0), "vkBindImageMemory (a present snapshot)");
+    VkImageViewCreateInfo vci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = s->image,
+                                 .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
+                                 .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    GPU_VK_OK(vkCreateImageView(gpu_vk.device, &vci, NULL, &s->view), "vkCreateImageView (a present snapshot)");
     s->w = w, s->h = h;
     return 1;
 }
@@ -746,8 +756,9 @@ static int present_slot(Slot *s, uint64_t seq, int game_frame, int force) {
     // the image arrives from the presentation engine (the acquire semaphore) with nothing worth keeping; the snapshot's
     // writes, and every earlier submission's, are made visible to the blit by the first scope of this barrier
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                           .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
-                           .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT};
+                           .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                           .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT |
+                                            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT};
     VkImageMemoryBarrier2 ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
                                 .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, .srcAccessMask = 0,
                                 .dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
@@ -766,17 +777,43 @@ static int present_slot(Slot *s, uint64_t seq, int game_frame, int force) {
                             .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT};
     VkDependencyInfo wd = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &waw};
     vkCmdPipelineBarrier2(cmd, &wd);
-    VkImageBlit b = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                     .srcOffsets = {{0, 0, 0}, {(int32_t)s->w, (int32_t)s->h, 1}},
-                     .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                     .dstOffsets = {{rc.x, rc.y, 0}, {rc.x + rc.w, rc.y + rc.h, 1}}};
-    vkCmdBlitImage(cmd, s->image, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
-    if (overlay) {
+    // Where the window is larger than the picture the scaler enlarges it (bicubic, sharpened); else, or with the setting on
+    // bilinear, the blit does. The scaler draws, so the image goes from the clear to COLOR_ATTACHMENT_OPTIMAL.
+    const int scaled = g_scale_on && rt_setting(RT_SET_upscaler) == 1 && ((uint32_t)rc.w > s->w || (uint32_t)rc.h > s->h);
+    if (scaled) {
         layout_barrier(cmd, dst, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                        VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        vks_record(cmd, s->view, s->w, s->h, g_sc.views[idx], g_sc.extent, rc.x, rc.y, rc.w, rc.h,
+                   (float)rt_setting(RT_SET_upscale_sharpness) / 100.0f);
+    } else {
+        VkImageBlit b = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                         .srcOffsets = {{0, 0, 0}, {(int32_t)s->w, (int32_t)s->h, 1}},
+                         .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                         .dstOffsets = {{rc.x, rc.y, 0}, {rc.x + rc.w, rc.y + rc.h, 1}}};
+        vkCmdBlitImage(cmd, s->image, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b,
+                       VK_FILTER_LINEAR);
+    }
+    if (overlay) {
+        if (scaled) {   // the scaler's writes are read by the overlay's blending, in the same layout
+            VkMemoryBarrier2 sb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                                   .srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                   .srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                   .dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                   .dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT};
+            VkDependencyInfo sd = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &sb};
+            vkCmdPipelineBarrier2(cmd, &sd);
+        } else {
+            layout_barrier(cmd, dst, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                           VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                           VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        }
         vko_record(cmd, value, fi, g_sc.views[idx], g_sc.extent, &dd);
+        layout_barrier(cmd, dst, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                       VK_PIPELINE_STAGE_2_NONE, 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    } else if (scaled) {
         layout_barrier(cmd, dst, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
                        VK_PIPELINE_STAGE_2_NONE, 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     } else {
@@ -964,6 +1001,7 @@ void vkw_open(void) {
     }
     note_machine();
     g_ui_on = vko_init(g_ui, g_surface_format);
+    g_scale_on = vks_init(g_surface_format);
     if (g_ui_on && g_ui->prepare) {
         WinState st;
         g_win->state(&st);
@@ -1002,6 +1040,7 @@ void vkw_close(void) {
     }
     for (int i = 0; i < SLOTS; i++) slot_image_drop(&g_slots[i]);
     if (g_ui_on) vko_close();
+    if (g_scale_on) vks_close(), g_scale_on = 0;
     g_ui_on = 0;
     if (g_surface) g_win->destroy_surface(gpu_vk.instance, (uint64_t)(uintptr_t)g_surface);
     g_surface = VK_NULL_HANDLE;
