@@ -45,7 +45,7 @@ struct VkbImage {
     uint64_t size;                // the game's storage bytes
     int placed, doomed, refs, pending;
     int arena;                    // its memory is an extent of the texture arena: the CPU writes its texels (vk_texture.c)
-    int decoded;                  // an ASTC texture the device does not sample: this image holds its decoded RGBA8 texels
+    int decoded;                  // an ASTC texture the device does not sample: this image holds its decoded texels, RGBA8 (1) or BC7 (2)
     int gpu_owned;                // a pass wrote the blocks of this arena image (vkb_image_gpu_wrote): the CPU's bytes upload no more (atomic)
     int counted, cls;             // in the table of classes (vkf_img_table_add): its arena or own memory; the class
     uint64_t cmem, cbc;           // what it was added with: the driver's size of its memory and its BC bytes
@@ -186,8 +186,10 @@ static VkbImage *image_make(const tex_t *t, const VkfRow *row, VkFormat vk, cons
     VkImageUsageFlags usage = arena ? arena_usage(fmt) : usage_of(fmt);
     VkImageCreateFlags flags = sh->flags | (arena ? 0 : VK_IMAGE_CREATE_ALIAS_BIT);
     if (!(row->flags & (VKF_DEPTH | VKF_STENCIL))) flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-    const int compressed = vkf_class(fmt) >= 2001 && vkf_class(fmt) < 4000;   // the BC and ASTC families
-    const int decoded = vkf_decoded(row, fmt);   // an ASTC texture the device does not sample: its image holds RGBA8 texels
+    const int decoded = vkf_decoded(row, fmt);   // an ASTC texture the device does not sample: its image holds RGBA8 texels, or BC7 blocks of them
+    // the BC and ASTC families; the BC7 of a transcoded ASTC texture holds the decoded texels, not the game's blocks, and
+    // is no target of a raw view of the game's blocks
+    const int compressed = vkf_class(fmt) >= 2001 && vkf_class(fmt) < 4000 && !decoded;
     // A volume a pass renders into slice by slice or a program stores into as 2D slices: the flags that make those views
     // exist (oot2/vk_view_plan.h). Depth, block-compressed and decoded images are never such targets.
     // A block-compressed image is one when a raw view of it is a target (its slices, below).
@@ -325,7 +327,7 @@ static VkbImage *image_make(const tex_t *t, const VkfRow *row, VkFormat vk, cons
                                                                                               : VK_IMAGE_ASPECT_COLOR_BIT;
     i->all_aspects = i->aspect | ((row->flags & (VKF_DEPTH | VKF_STENCIL)) == (VKF_DEPTH | VKF_STENCIL) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
     i->size = L.size, i->placed = placed;
-    i->decoded = decoded;
+    i->decoded = decoded ? (vkf_class(fmt) == 2008 ? 2 : 1) : 0;   // 2: the texels are BC7 (the ASTC transcode)
     if (arena) i->arena = 1, i->ext = ext, i->desc = t->d;
     g_st.made++, g_st.live++;
     if (placed) g_st.placed++;
@@ -475,6 +477,17 @@ void vkb_image_release(const tex_t *t) {
 
 void vkb_image_reap(void) {
     plat_mutex_lock(&g_mu);
+    // What the images in the arena or with memory of their own hold, every 900 calls (about 15 s): the ASTC textures the device
+    // does not sample, decoded to RGBA8, against what the same textures would cost in BC (a transcode would make them), the
+    // textures the device samples as they are, and the rest.
+    static unsigned reaps;
+    if (++reaps % 900 == 0) {
+        VkfImgColumns c;
+        vkf_img_columns(&g_st.cls, &c);
+        rt_log("gfx: vulkan: images: %llu decoded ASTC (%llu MiB, %llu MiB in the arena; %llu MiB as BC), native BC %llu MiB, "
+               "other %llu MiB", (ull)c.dec_images, (ull)((c.dec_w[0] + c.dec_w[1] + c.dec_w[2] + c.dec_w[3] + c.dec_w[4] + c.dec_w[5]) >> 20),
+               (ull)(c.dec_arena >> 20), (ull)(c.bc_equiv >> 20), (ull)(c.native_bc >> 20), (ull)(c.other >> 20));
+    }
     uint64_t d = done();
     VkbImage **p = &g_doomed;
     while (*p) {

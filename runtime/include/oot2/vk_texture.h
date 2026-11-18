@@ -57,6 +57,7 @@ typedef struct VktStats {
     uint64_t regions, raw_bytes, linear_bytes;   // regions untiled and copied, the bytes read from guest memory and written
     uint64_t dispatches, copies, zero_regions;
     uint64_t scratch_resets, scratch_grown;
+    uint64_t bc7_blocks;                              // BC7 blocks the transcode encoded from decoded ASTC
     uint64_t astc_regions, astc_blocks, astc_bytes;   // regions decoded from ASTC, their blocks, and the RGBA8 bytes written for them
 } VktStats;
 void vkt_stats(VktStats *out);

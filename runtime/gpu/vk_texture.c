@@ -14,6 +14,7 @@
 #include "oot2/gpu_vk.h"
 #include "oot2/nvn_tex.h"
 #include "oot2/runtime.h"
+#include "oot2/settings.h"
 #include "oot2/texmem.h"
 #include "oot2/vk_format.h"
 #include "oot2/vk_texture.h"
@@ -38,6 +39,13 @@ typedef struct AstcPush {
 } AstcPush;
 _Static_assert(sizeof(AstcPush) == 40, "the push constants of astc_decode.comp are 40 bytes");
 
+// The BC7 encoder's push constants (bc7_encode.comp).
+typedef struct Bc7Push {
+    uint64_t src, dst;
+    uint32_t pitch, width, height, blocks_x, blocks_y, pad;
+} Bc7Push;
+_Static_assert(sizeof(Bc7Push) == 40, "the push constants of bc7_encode.comp are 40 bytes");
+
 typedef struct Retire {
     VkBuffer buf;
     VkDeviceMemory mem;
@@ -50,6 +58,8 @@ static struct {
     VkPipeline pipe;
     VkPipelineLayout alayout;
     VkPipeline apipe;
+    VkPipelineLayout blayout;   // the BC7 encoder
+    VkPipeline bpipe;
     VkBuffer scratch;
     VkDeviceMemory scratch_mem;
     uint64_t scratch_addr, scratch_size, scratch_off, scratch_value;
@@ -154,6 +164,7 @@ void vkt_open(void) {
     if (!g.open) {
         memset(&g, 0, sizeof g);
         g.open = 1;
+        vkf_astc_bc7 = rt_setting(RT_SET_astc_bc7) != 0;   // before any image is made: the format an ASTC texture stands in
         texmem_open(&k_ops);
     }
     plat_mutex_unlock(&g_mu);
@@ -236,6 +247,26 @@ static void astc_pipeline_ensure(void) {
     vkDestroyShaderModule(gpu_vk.device, m, NULL);
 }
 
+// The BC7 encoder pass (the ASTC transcode), made at the first region that needs it.
+static void bc7_pipeline_ensure(void) {
+    if (g.bpipe) return;
+    const GpuShader *s = gpu_shader("bc7_encode");
+    if (!s) rt_fatal("gfx: vulkan: the runtime was built without the bc7_encode shader");
+    VkShaderModuleCreateInfo mi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = s->size, .pCode = s->code};
+    VkShaderModule m;
+    GPU_VK_OK(vkCreateShaderModule(gpu_vk.device, &mi, NULL, &m), "vkCreateShaderModule (bc7_encode)");
+    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Bc7Push)};
+    VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .pushConstantRangeCount = 1,
+                                     .pPushConstantRanges = &pr};
+    GPU_VK_OK(vkCreatePipelineLayout(gpu_vk.device, &li, NULL, &g.blayout), "vkCreatePipelineLayout (bc7_encode)");
+    VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                                      .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main"},
+                                      .layout = g.blayout};
+    GPU_VK_OK(vkCreateComputePipelines(gpu_vk.device, VK_NULL_HANDLE, 1, &ci, NULL, &g.bpipe), "vkCreateComputePipelines (bc7_encode)");
+    vkDestroyShaderModule(gpu_vk.device, m, NULL);
+}
+
 static void barrier(VkCommandBuffer cb, VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
                     VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access) {
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = src_stage, .srcAccessMask = src_access,
@@ -248,6 +279,13 @@ static void dispatch(VkCommandBuffer cb, const Push *p) {
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipe);
     vkCmdPushConstants(cb, g.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof *p, p);
     vkCmdDispatch(cb, (((p->row_bytes + 15) >> 4) + 15) / 16, (p->rows + 3) / 4, p->slices);
+    g.st.dispatches++;
+}
+
+static void bc7_dispatch(VkCommandBuffer cb, const Bc7Push *p) {
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g.bpipe);
+    vkCmdPushConstants(cb, g.blayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof *p, p);
+    vkCmdDispatch(cb, (p->blocks_x + 7) / 8, (p->blocks_y + 7) / 8, 1);
     g.st.dispatches++;
 }
 
@@ -351,6 +389,7 @@ void vkt_upload(const nvn_texdesc *d, uint64_t storage, VkImage image, VkImageAs
     }
     pipeline_ensure();
     if (astc_decode) astc_pipeline_ensure();
+    if (astc_decode == 2) bc7_pipeline_ensure();   // the ASTC transcode: the decoded texels are encoded to BC7
     const VkfRow *frow = vkf_row(d->format);
     VkCommandBuffer cb = gpu_vk_prologue();
     if (first) {   // no layout yet: every level and layer to GENERAL before the first copy
@@ -397,15 +436,22 @@ void vkt_upload(const nvn_texdesc *d, uint64_t storage, VkImage image, VkImageAs
             uint64_t pitch = up(ug.row_bytes, 16), lin = pitch * ug.rows * ug.slices;
             // ASTC to RGBA8: the rows of blocks the untile pass writes are read by the decode, which writes whole blocks of
             // texels after them in the same scratch allocation (one take, so that neither can wrap under the other).
-            uint64_t blocks_x = ug.row_bytes / 16, dec_at = 0, dec = 0;
+            uint64_t blocks_x = ug.row_bytes / 16, dec_at = 0, dec = 0, enc_at = 0, enc = 0, need = lin;
+            const uint32_t bx4 = (ug.width + 3) / 4, by4 = (ug.height + 3) / 4;   // the BC7 blocks of the region
             if (astc_decode) {
                 if (!frow || !(frow->flags & VKF_ASTC) || ug.slices != 1 || ug.bpb != 16)
                     rt_fatal("gfx: vulkan: the texture at %#llx (target %d, NVN format %#x) is not decoded from ASTC: only a 2D or "
                              "layered ASTC texture is", (ull)storage, d->target, d->format);
                 dec_at = up(lin, 256);
                 dec = blocks_x * ug.bw * 4 * ug.rows * ug.bh;
+                need = dec_at + dec;
+                if (astc_decode == 2) {   // the BC7 blocks go after the decoded texels in the same scratch allocation
+                    enc_at = up(dec_at + dec, 256);
+                    enc = (uint64_t)bx4 * by4 * 16;
+                    need = enc_at + enc;
+                }
             }
-            if (dispatched && !scratch_fits(value, astc_decode ? dec_at + dec : lin)) {
+            if (dispatched && !scratch_fits(value, need)) {
                 // The scratch is about to be reused: the regions untiled so far are copied out of it first.
                 barrier(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
                         VK_ACCESS_2_TRANSFER_READ_BIT);
@@ -414,7 +460,7 @@ void vkt_upload(const nvn_texdesc *d, uint64_t storage, VkImage image, VkImageAs
                 dispatched = 0;
             }
             VkBuffer sbuf;
-            uint64_t saddr, soff = scratch_take(cb, value, astc_decode ? dec_at + dec : lin, &sbuf, &saddr);
+            uint64_t saddr, soff = scratch_take(cb, value, need, &sbuf, &saddr);
             Push p = {.src = raw.address, .dst = saddr, .row_bytes = ug.row_bytes, .rows = ug.rows, .slices = ug.slices,
                       .gobs_x = ug.gobs_x, .tile_h = ug.tile_h, .tile_d = ug.tile_d, .pitch = (uint32_t)pitch,
                       .order = UNTILE_GOB_ORDER};
@@ -426,11 +472,25 @@ void vkt_upload(const nvn_texdesc *d, uint64_t storage, VkImage image, VkImageAs
                 AstcPush ap = {.src = saddr, .dst = saddr + dec_at, .bw = ug.bw, .bh = ug.bh, .blocks_x = (uint32_t)blocks_x,
                                .blocks_y = ug.rows, .srgb = (frow->flags & VKF_SRGB) != 0};
                 astc_dispatch(cb, &ap);
-                copies[i] = (Copy){.buf = sbuf,
-                                   .c = {.bufferOffset = soff + dec_at, .bufferRowLength = (uint32_t)(blocks_x * ug.bw),
-                                         .bufferImageHeight = ug.rows * ug.bh,
-                                         .imageSubresource = {aspect, r->level, r->layer, 1},
-                                         .imageExtent = {ug.width, ug.height, 1}}};
+                if (astc_decode == 2) {
+                    // the texels the decode wrote are encoded to BC7 blocks; the copy takes the blocks, whose rows are in texels
+                    barrier(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT);
+                    Bc7Push bp = {.src = saddr + dec_at, .dst = saddr + enc_at, .pitch = (uint32_t)(blocks_x * ug.bw),
+                                  .width = ug.width, .height = ug.height, .blocks_x = bx4, .blocks_y = by4};
+                    bc7_dispatch(cb, &bp);
+                    copies[i] = (Copy){.buf = sbuf,
+                                       .c = {.bufferOffset = soff + enc_at, .bufferRowLength = bx4 * 4, .bufferImageHeight = by4 * 4,
+                                             .imageSubresource = {aspect, r->level, r->layer, 1},
+                                             .imageExtent = {ug.width, ug.height, 1}}};
+                    g.st.bc7_blocks += (uint64_t)bx4 * by4;
+                } else {
+                    copies[i] = (Copy){.buf = sbuf,
+                                       .c = {.bufferOffset = soff + dec_at, .bufferRowLength = (uint32_t)(blocks_x * ug.bw),
+                                             .bufferImageHeight = ug.rows * ug.bh,
+                                             .imageSubresource = {aspect, r->level, r->layer, 1},
+                                             .imageExtent = {ug.width, ug.height, 1}}};
+                }
                 g.st.astc_regions++, g.st.astc_blocks += blocks_x * ug.rows, g.st.astc_bytes += dec;
             } else {
                 copies[i] = (Copy){.buf = sbuf,
@@ -439,7 +499,7 @@ void vkt_upload(const nvn_texdesc *d, uint64_t storage, VkImage image, VkImageAs
                                          .imageSubresource = {aspect, r->level, r->layer, 1},
                                          .imageExtent = {ug.width, ug.height, ug.depth}}};
             }
-            g.st.raw_bytes += ug.span, g.st.linear_bytes += astc_decode ? dec : lin;
+            g.st.raw_bytes += ug.span, g.st.linear_bytes += astc_decode ? (astc_decode == 2 ? enc : dec) : lin;
         }
         g.st.zero_regions += (uint64_t)r->zero;
         g.st.regions++;

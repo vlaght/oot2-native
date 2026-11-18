@@ -133,6 +133,8 @@ static const VkfRow rows[VKF_LAST + 1] = {
     X(0x9B, VK_FORMAT_B8G8R8A8_SRGB, 4, VKF_SRGB), CF(0x9C, VK_FORMAT_B8G8R8A8_SRGB, 4, VKF_SRGB),
 };
 
+int vkf_astc_bc7;
+
 const VkfRow *vkf_row(int f) {
     if (f < VKF_FIRST || f > VKF_LAST) return NULL;
     return &rows[f];
@@ -153,6 +155,13 @@ VkFormat vkf_pick(const VkfRow *r, VkfSupported supported, void *ctx, uint8_t sw
     if (supported(r->vk, ds, ctx)) {
         memcpy(swz, r->swz, 4);
         return r->vk;
+    }
+    if (vkf_astc_bc7 && (r->flags & VKF_ASTC)) {   // the ASTC transcode: BC7 stands in, the upload encodes to it
+        VkFormat bc7 = (r->flags & VKF_SRGB) ? VK_FORMAT_BC7_SRGB_BLOCK : VK_FORMAT_BC7_UNORM_BLOCK;
+        if (supported(bc7, ds, ctx)) {
+            memcpy(swz, r->alt_swz, 4);
+            return bc7;
+        }
     }
     if (r->alt != VK_FORMAT_UNDEFINED && supported(r->alt, ds, ctx)) {
         memcpy(swz, r->alt_swz, 4);
@@ -222,7 +231,7 @@ VkFormat vkf_linear_twin(VkFormat f) {
 int vkf_decoded(const VkfRow *r, VkFormat made) {
     if (!r || !(r->flags & VKF_ASTC)) return 0;
     int c = vkf_class(made);
-    return !(c >= 2001 && c < 4000);   // not in the BC and ASTC families: the device took the stand-in
+    return !(c >= 3000 && c < 4000);   // not in the ASTC family: the device took the stand-in (RGBA8, or BC7 with the transcode)
 }
 
 int vkf_extent_ok(const VkfRow *r, VkFormat made) { return !vkf_decoded(r, made); }

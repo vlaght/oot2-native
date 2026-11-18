@@ -71,9 +71,13 @@ VkFormat vkf_linear_twin(VkFormat f);
 
 // ---- images of decoded ASTC. A device that does not sample ASTC takes the row's alt (RGBA8, or sRGB) for an ASTC texture,
 // and the upload decodes the game's blocks into it: such an image holds texels, not the game's blocks. Without a device.
-// 1 when an image made in format `made` for row r is that image of decoded texels (the row is ASTC and `made` is no BC or
-// ASTC format); 0 for every other image, an ASTC one the device samples as blocks included.
+// 1 when an image made in format `made` for row r is that image of decoded texels (the row is ASTC and `made` is no ASTC
+// format: RGBA8, or BC7 where vkf_astc_bc7 is set); 0 for every other image, an ASTC one the device samples as blocks included.
 int vkf_decoded(const VkfRow *r, VkFormat made);
+// 1 makes vkf_pick take BC7 (UNORM or sRGB) as the stand-in of an ASTC row the device does not sample, where the device
+// samples BC7, instead of the row's alt (RGBA8): the upload then encodes the decoded texels to BC7 (the ASTC transcode), a
+// quarter of the memory. Set once at start (the setting astc_bc7); 0 leaves every pick as the table says.
+extern int vkf_astc_bc7;
 // 1 when an image made so may stand in its pool's extent, where the game's storage lies in the row's own layout. An image of
 // decoded texels never may: it would read the compressed blocks as RGBA8 texels, and its upload would overwrite them. It
 // gets memory of its own.

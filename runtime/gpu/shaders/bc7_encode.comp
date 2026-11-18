@@ -1,0 +1,175 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The oot2-native contributors
+//
+// The BC7 encoder (runtime/gpu/vk_texture.c): the RGBA8 texels the ASTC decode made (astc_decode.comp) become 16-byte BC7
+// blocks that a buffer-to-image copy takes into an image of VK_FORMAT_BC7_*: a quarter of the memory of the RGBA8 image.
+//
+// One invocation encodes one block of 4x4 texels, in mode 6 of the format (one subset, 7-bit endpoints with a shared
+// p-bit each, 4-bit indices, alpha coded like the colour): the endpoints come from the principal axis of the block's
+// texels, are quantized with the better p-bit, the indices are the nearest of the 16 interpolants, and one round of least
+// squares moves the endpoints to where the indices say they should be, kept only when the error falls. The error is
+// measured on the stored bytes: an sRGB texture is encoded as it is stored, which the BC7_SRGB format reads back as it was.
+// A texel past the image's edge (the block grid is rounded up to 4) takes the nearest texel inside it.
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Texels { uint texel[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) writeonly buffer Blocks { uvec4 block[]; };
+
+layout(push_constant) uniform PushConstants {
+    Texels src;      // rows of `pitch` texels, one 32-bit word each (R in the low byte)
+    Blocks dst;      // blocks_y rows of blocks_x blocks
+    uint pitch;      // texels in a row of src
+    uint width;      // the image's size in texels: nothing past it is read
+    uint height;
+    uint blocks_x;
+    uint blocks_y;
+    uint pad;
+};
+
+// the weights of a 4-bit index, in 64ths
+const uint W4[16] = uint[16](0u, 4u, 9u, 13u, 17u, 21u, 26u, 30u, 34u, 38u, 43u, 47u, 51u, 55u, 60u, 64u);
+
+vec4 px[16];
+
+// the error of the 16 texels against the interpolants of the dequantized endpoints e0, e1 (0 to 255), with the best
+// index of each written to idx
+float fit(vec4 e0, vec4 e1, out uint idx[16]) {
+    vec4 d = e1 - e0;
+    float dd = dot(d, d);
+    float total = 0.0;
+    for (int i = 0; i < 16; i++) {
+        float t = dd > 0.0 ? dot(px[i] - e0, d) / dd : 0.0;
+        int k = clamp(int(floor(t * 15.0 + 0.5)), 0, 15);
+        float best = 1e30;
+        int bk = k;
+        for (int j = max(k - 1, 0); j <= min(k + 1, 15); j++) {
+            float w = float(W4[j]) / 64.0;
+            vec4 r = e0 + d * w;
+            vec4 df = px[i] - floor(r + 0.5);   // the decoder rounds the interpolant
+            float e = dot(df, df);
+            if (e < best) best = e, bk = j;
+        }
+        idx[i] = uint(bk);
+        total += best;
+    }
+    return total;
+}
+
+// an endpoint (0 to 255 per channel) quantized to 7 bits with a p-bit: the better of the two p-bits; q gets the 7-bit values
+// and the p-bit in its w... the dequantized endpoint is returned in deq
+void quant(vec4 e, out uvec4 q, out uint p, out vec4 deq) {
+    float bestErr = 1e30;
+    q = uvec4(0), p = 0u, deq = vec4(0.0);
+    for (uint pb = 0u; pb < 2u; pb++) {
+        vec4 qf = clamp(floor((e - float(pb)) * 0.5 + 0.5), 0.0, 127.0);
+        vec4 r = qf * 2.0 + float(pb);
+        vec4 df = e - r;
+        float err = dot(df, df);
+        if (err < bestErr) bestErr = err, q = uvec4(qf), p = pb, deq = r;
+    }
+}
+
+void put(inout uvec4 b, uint pos, uint val, uint n) {
+    uint w = pos >> 5, o = pos & 31u;
+    uint lo = val << o;
+    if (w == 0u) b.x |= lo; else if (w == 1u) b.y |= lo; else if (w == 2u) b.z |= lo; else b.w |= lo;
+    if (o + n > 32u) {
+        uint hi = val >> (32u - o);
+        if (w == 0u) b.y |= hi; else if (w == 1u) b.z |= hi; else if (w == 2u) b.w |= hi;
+    }
+}
+
+void main() {
+    uint bx = gl_GlobalInvocationID.x, by = gl_GlobalInvocationID.y;
+    if (bx >= blocks_x || by >= blocks_y) return;
+
+    for (uint i = 0u; i < 16u; i++) {
+        uint x = min(bx * 4u + (i & 3u), width - 1u), y = min(by * 4u + (i >> 2u), height - 1u);
+        uint t = src.texel[y * pitch + x];
+        px[i] = vec4(float(t & 255u), float((t >> 8) & 255u), float((t >> 16) & 255u), float(t >> 24));
+    }
+
+    // the principal axis of the texels
+    vec4 mean = vec4(0.0);
+    for (int i = 0; i < 16; i++) mean += px[i];
+    mean *= 1.0 / 16.0;
+    vec4 mn = px[0], mx = px[0];
+    mat4 cov = mat4(0.0);
+    for (int i = 0; i < 16; i++) {
+        vec4 d = px[i] - mean;
+        mn = min(mn, px[i]), mx = max(mx, px[i]);
+        cov += mat4(d * d.x, d * d.y, d * d.z, d * d.w);
+    }
+    vec4 axis = mx - mn;
+    for (int it = 0; it < 4; it++) {
+        vec4 v = cov * axis;
+        float l = length(v);
+        if (l < 1e-6) break;
+        axis = v / l;
+    }
+    if (dot(axis, axis) < 1e-8) axis = vec4(1.0, 0.0, 0.0, 0.0);
+    float tmin = 1e30, tmax = -1e30;
+    for (int i = 0; i < 16; i++) {
+        float t = dot(px[i] - mean, axis);
+        tmin = min(tmin, t), tmax = max(tmax, t);
+    }
+    vec4 e0 = clamp(mean + axis * tmin, 0.0, 255.0), e1 = clamp(mean + axis * tmax, 0.0, 255.0);
+
+    uvec4 q0, q1;
+    uint p0, p1;
+    vec4 d0, d1;
+    uint idx[16];
+    quant(e0, q0, p0, d0);
+    quant(e1, q1, p1, d1);
+    float err = fit(d0, d1, idx);
+
+    // one round of least squares: the endpoints that the indices call for
+    if (err > 0.0) {
+        float saa = 0.0, sab = 0.0, sbb = 0.0;
+        vec4 sap = vec4(0.0), sbp = vec4(0.0);
+        for (int i = 0; i < 16; i++) {
+            float b = float(W4[idx[i]]) / 64.0, a = 1.0 - b;
+            saa += a * a, sab += a * b, sbb += b * b;
+            sap += a * px[i], sbp += b * px[i];
+        }
+        float det = saa * sbb - sab * sab;
+        if (abs(det) > 1e-4) {
+            vec4 n0 = clamp((sap * sbb - sbp * sab) / det, 0.0, 255.0), n1 = clamp((sbp * saa - sap * sab) / det, 0.0, 255.0);
+            uvec4 r0, r1;
+            uint rp0, rp1;
+            vec4 rd0, rd1;
+            uint ridx[16];
+            quant(n0, r0, rp0, rd0);
+            quant(n1, r1, rp1, rd1);
+            float e2 = fit(rd0, rd1, ridx);
+            if (e2 < err) {
+                err = e2, q0 = r0, q1 = r1, p0 = rp0, p1 = rp1, d0 = rd0, d1 = rd1;
+                for (int i = 0; i < 16; i++) idx[i] = ridx[i];
+            }
+        }
+    }
+
+    // the first texel's index has its top bit implied 0: swap the endpoints and invert the indices when it is set
+    if (idx[0] >= 8u) {
+        uvec4 tq = q0; q0 = q1; q1 = tq;
+        uint tp = p0; p0 = p1; p1 = tp;
+        for (int i = 0; i < 16; i++) idx[i] = 15u - idx[i];
+    }
+
+    uvec4 b = uvec4(0u);
+    put(b, 0u, 64u, 7u);   // mode 6: six zero bits and a one
+    uint pos = 7u;
+    for (int c = 0; c < 4; c++) {   // R0 R1 G0 G1 B0 B1 A0 A1, 7 bits each
+        put(b, pos, q0[c], 7u), pos += 7u;
+        put(b, pos, q1[c], 7u), pos += 7u;
+    }
+    put(b, pos, p0, 1u), pos += 1u;
+    put(b, pos, p1, 1u), pos += 1u;
+    put(b, pos, idx[0], 3u), pos += 3u;
+    for (int i = 1; i < 16; i++) put(b, pos, idx[i], 4u), pos += 4u;
+    dst.block[by * blocks_x + bx] = b;
+}

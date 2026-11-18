@@ -260,7 +260,11 @@ void texarena_alloc(uint64_t size, uint64_t align, uint32_t type_bits, TexExtent
         uint64_t used = 0, budget = 0;
         int known = g.ops.budget(&used, &budget);
         const char *why = NULL;
-        if (g.arena_bytes + bsz > TEXARENA_CAP) why = "the arena's cap";
+        // The cap is TEXARENA_CAP, which suits a card of 8 GiB, or half of the device's memory budget where that is more: a
+        // card with more memory has room for the textures of a scene the small one has not (the budget check below still
+        // keeps an eighth free).
+        const uint64_t cap = known && budget / 2 > TEXARENA_CAP ? budget / 2 : TEXARENA_CAP;
+        if (g.arena_bytes + bsz > cap) why = "the arena's cap";
         else if (known && !backing_mirror_fits(used, budget, bsz)) why = "the device's memory budget";
         uint64_t handle = 0;
         if (!why && !g.ops.block_new(type, bsz, &handle)) why = "the device (it refused the block)";
@@ -275,7 +279,7 @@ void texarena_alloc(uint64_t size, uint64_t align, uint32_t type_bits, TexExtent
             rt_fatal("gfx: vulkan: the texture arena is full (%s): an image needs %llu bytes at alignment %llu, the arena "
                      "holds %llu of its %llu bytes in %llu blocks with %llu in extents and %llu its largest free run; the "
                      "device heap uses %llu of a budget of %llu; evicting textures by uploading them again is not built",
-                     why, (ull)need, (ull)align, (ull)live, (ull)TEXARENA_CAP, (ull)blocks, (ull)in_extents, (ull)best,
+                     why, (ull)need, (ull)align, (ull)live, (ull)cap, (ull)blocks, (ull)in_extents, (ull)best,
                      (ull)used, (ull)budget);
         }
         int slot = -1;
