@@ -43,6 +43,8 @@
 #include "oot2/spirv.h"
 #include "oot2/vk_caps.h"
 #include "oot2/vk_hmma.h"
+#include "oot2/ledger.h"
+#include "oot2/shader_translate.h"
 #include "oot2/vk_pipeline.h"
 #include "plat.h"
 
@@ -96,12 +98,14 @@ static struct {
 int vkp_store_open(const char *base, const char *variants, char *why, size_t cap) {
     ShcError e = shc_set_open(&P.set, base, variants, SHC_DESC_SCHEMA, why, cap);
     P.store_open = e == SHC_OK;
+    if (P.store_open) sht_open(base);
     return P.store_open;
 }
 
 int vkp_store_open_map(const char *base, const char *variants, const char *map, char *why, size_t cap) {
     ShcError e = shc_set_open_map(&P.set, base, variants, map, SHC_DESC_SCHEMA, why, cap);
     P.store_open = e == SHC_OK;
+    if (P.store_open) sht_open(base);
     return P.store_open;
 }
 
@@ -110,11 +114,85 @@ void vkp_stage_set_ledger_digest(VkpStage *stage, const uint8_t digest[SHC_DIGES
     stage->has_ledger_digest = 1;
 }
 
+// What a state the map does not know is served by, remembered by (stage key, full digest): the description is read and the
+// projection made once, not for every draw.
+#define PROJ_CACHE 8192u
+static struct ProjEntry {
+    char key[SHC_KEY_BYTES];
+    uint8_t digest[SHC_DIGEST_BYTES], projected[SHC_DIGEST_BYTES];
+    int used, rt_variant;
+} g_proj[PROJ_CACHE];
+static PlatMutex g_proj_mu = PLAT_MUTEX_INIT;
+
+static uint32_t proj_slot(const char *key, const uint8_t *digest) {
+    uint64_t h = 1469598103934665603ull;
+    for (const char *c = key; *c; c++) h = (h ^ (uint8_t)*c) * 1099511628211ull;
+    for (int i = 0; i < 8; i++) h = (h ^ digest[i]) * 1099511628211ull;
+    return (uint32_t)(h >> 20) % PROJ_CACHE;
+}
+
+void vkp_stage_resolve_projection(VkpStage *s, LedgerTrack *track, int kind) {
+    s->use_projected = 0, s->rt_variant = 0;
+    if (!P.store_open || !s->key || !s->has_ledger_digest) return;
+    uint8_t target[SHC_DIGEST_BYTES];
+    const int mapped = P.set.has_variant_map && shc_set_resolve_ledger(&P.set, s->key, s->ledger_digest, target);
+    if (mapped) return;   // the map knows this state
+    uint32_t at = proj_slot(s->key, s->ledger_digest);
+    plat_mutex_lock(&g_proj_mu);
+    struct ProjEntry *c = &g_proj[at];
+    int hit = c->used && !strcmp(c->key, s->key) && !memcmp(c->digest, s->ledger_digest, SHC_DIGEST_BYTES);
+    uint8_t proj[SHC_DIGEST_BYTES];
+    int rtv = 0;
+    if (hit) {
+        memcpy(proj, c->projected, sizeof proj);
+        rtv = c->rt_variant;
+        plat_mutex_unlock(&g_proj_mu);
+    } else {
+        plat_mutex_unlock(&g_proj_mu);
+        memset(proj, 0, sizeof proj);
+        ShcEntry be;
+        LedgerReads rd;
+        if (!shc_find(&P.set.base, s->key, NULL, &be) || be.status != SHC_TRANSLATED ||
+            !ledger_reads_parse(be.description, be.description_bytes, &rd))
+            return;   // no projection can be made: the stage is served as the map says (the base)
+        char *text = NULL;
+        if (!ledger_track_projected_digest(track, kind, &rd, proj, &text)) memset(proj, 0, sizeof proj);
+        // a variant that no pack holds is translated now (the ledger rows of this run let prepare pack it next time)
+        ShcEntry tmp;
+        if (text && !mapped && !(P.set.has_variants && shc_find(&P.set.variants, s->key, proj, &tmp))) {
+            int idx;
+            char why[320];
+            if (sht_variant(s->key, proj, text, &idx, why, sizeof why)) {
+                rtv = idx + 1;
+                uint64_t n = sht_count();
+                if (n <= 8 || !(n % 50))
+                    rt_log("gfx: vulkan: variant %s%s translated on demand (%llu made so far)", s->key, text, (unsigned long long)n);
+            } else {
+                rt_log("gfx: vulkan: variant of %s is in no pack and could not be translated on demand: %s", s->key, why);
+            }
+        }
+        free(text);
+        plat_mutex_lock(&g_proj_mu);
+        c = &g_proj[at];
+        snprintf(c->key, sizeof c->key, "%s", s->key);
+        memcpy(c->digest, s->ledger_digest, SHC_DIGEST_BYTES);
+        memcpy(c->projected, proj, sizeof proj);
+        c->rt_variant = rtv;
+        c->used = 1;
+        plat_mutex_unlock(&g_proj_mu);
+    }
+    s->use_projected = 1;
+    s->rt_variant = rtv;
+    memcpy(s->projected, proj, sizeof proj);
+}
+
 void vkp_stage_content_digest(const VkpStage *stage, uint8_t digest[SHC_DIGEST_BYTES]) {
     memset(digest, 0, SHC_DIGEST_BYTES);
     if (!P.store_open || !stage || !stage->key) return;
     ShcEntry entry;
-    int from = stage->has_ledger_digest
+    int from = stage->rt_variant && sht_entry(stage->rt_variant - 1, &entry) ? SHC_FROM_VARIANTS
+               : stage->use_projected ? shc_set_find(&P.set, stage->key, stage->projected, &entry)
+               : stage->has_ledger_digest
                    ? shc_set_find_ledger(&P.set, stage->key, stage->ledger_digest, &entry, NULL)
                    : shc_set_find(&P.set, stage->key, stage->answers, &entry);
     if (from != SHC_MISS) memcpy(digest, entry.answers, SHC_DIGEST_BYTES);
@@ -142,7 +220,7 @@ static void shape_text(const VkpStage *s, char *out, size_t cap) {
 
 static void digest_text(const VkpStage *s, char *out, size_t cap) {
     out[0] = 0;
-    const uint8_t *answers = s ? (s->has_ledger_digest ? s->ledger_digest : s->answers) : NULL;
+    const uint8_t *answers = s ? (s->use_projected ? s->projected : s->has_ledger_digest ? s->ledger_digest : s->answers) : NULL;
     if (!answers) return;
     static const uint8_t zero[SHC_DIGEST_BYTES];
     if (!memcmp(answers, zero, sizeof zero)) return;
@@ -154,7 +232,9 @@ static void cache_digest_text(const VkpStage *s, char *out, size_t cap) {
     uint8_t digest[SHC_DIGEST_BYTES] = {0};
     out[0] = 0;
     if (!s) return;
-    if (s->has_ledger_digest) {
+    if (s->use_projected) {
+        memcpy(digest, s->projected, sizeof digest);
+    } else if (s->has_ledger_digest) {
         if (P.store_open)
             shc_set_resolve_ledger(&P.set, s->key, s->ledger_digest, digest);
     } else if (s->answers) {
@@ -175,7 +255,11 @@ void vkp_module(const VkpStage *s, int expect, VkpModule *out) {
     ShcEntry e;
     int from = SHC_MISS;
     if (P.store_open && s->key) {
-        if (s->has_ledger_digest) {
+        if (s->rt_variant && sht_entry(s->rt_variant - 1, &e)) {
+            from = SHC_FROM_VARIANTS;   // translated on demand
+        } else if (s->use_projected) {
+            from = shc_set_find(&P.set, s->key, s->projected, &e);
+        } else if (s->has_ledger_digest) {
             int mapped = 0;
             from = shc_set_find_ledger(&P.set, s->key, s->ledger_digest, &e, &mapped);
             if (!P.set.has_variant_map)

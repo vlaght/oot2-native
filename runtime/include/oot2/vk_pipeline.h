@@ -84,7 +84,17 @@ typedef struct VkpStage {
     const nvn_stage *shape;     // what to print when the stage cannot be served; may be NULL
     uint8_t ledger_digest[SHC_DIGEST_BYTES];
     int has_ledger_digest;
+    // set by vkp_stage_resolve_projection: the ledger's full digest is in no row of the map, and the stage is served under
+    // the digest of the answers its module reads (the variant's), or the base module when that is zero
+    int use_projected;
+    uint8_t projected[SHC_DIGEST_BYTES];
+    int rt_variant;             // 1 + the index of the variant translated on demand for it (oot2/shader_translate.h), else 0
 } VkpStage;
+struct LedgerTrack;
+// For a stage with a ledger digest that the variant map does not know (a state the ledger has not seen): work out what
+// prepare would have mapped it to, from the module's description and the tracker's current state (kind is the NVN stage
+// kind the digest was made for), and serve the stage by that. A known digest is left to the map.
+void vkp_stage_resolve_projection(VkpStage *stage, struct LedgerTrack *track, int kind);
 
 typedef struct VkpModule {
     const uint32_t *code;       // SPIR-V words, inside the mapped pack
