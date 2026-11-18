@@ -295,7 +295,7 @@ def build(dest: Path, cc: str, cxx: str, ar: str, ninja: str, cmake: str) -> lis
         build_dir, stage = work / "build", work / "stage"
         configure = [cmake, "-S", str(src), "-B", str(build_dir), "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={posix(ninja)}",
                      f"-DCMAKE_C_COMPILER={posix(cc)}", f"-DCMAKE_CXX_COMPILER={posix(cxx)}", f"-DCMAKE_AR={posix(ar)}",
-                     "-DCMAKE_BUILD_TYPE=Release", f"-DCMAKE_INSTALL_PREFIX={stage}", *(f"-D{o}" for o in OPTIONS)]
+                     "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_INSTALL_LIBDIR=lib", f"-DCMAKE_INSTALL_PREFIX={stage}", *(f"-D{o}" for o in OPTIONS)]
         run(configure, "configuring SDL")
         configs = sorted(build_dir.glob("include-config-*/build_config/SDL_build_config.h"))
         if not configs:

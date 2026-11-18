@@ -481,11 +481,18 @@ void plat_fibre_free(PlatFibre *f) {
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <ucontext.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <linux/fs.h>
+#include <linux/userfaultfd.h>
+#endif
 
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
@@ -517,16 +524,90 @@ void plat_write_stderr(const char *p, size_t n) {
 
 static int posix_prot(int prot) { return prot == PLAT_RW ? PROT_READ | PROT_WRITE : prot == PLAT_R ? PROT_READ : PROT_NONE; }
 
+// ---- write watch (Linux 6.7 and later): the same service Windows gives with MEM_WRITE_WATCH and GetWriteWatch. A watched
+// reservation is registered with a userfaultfd in asynchronous write-protect mode and write-protected once; the kernel
+// then lifts the protection of a page by itself at its first write (no fault reaches this process) and notes that the
+// page was written, which PAGEMAP_SCAN reads, and re-arms when asked to reset. An unprivileged process may do this
+// (UFFD_USER_MODE_ONLY). Where the kernel lacks it, plat_written says so, as before, and the GPU back end imports the
+// pages instead of mirroring them: a discrete GPU then reads them across the bus, 22.9 times slower than VRAM (D14).
+#ifdef __linux__
+enum { WATCH_MAX = 16 };
+static struct { uint64_t addr, size; } g_watched[WATCH_MAX];
+static int g_nwatched, g_uffd = -2, g_pagemap = -1;
+static pthread_mutex_t g_watch_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int watch_open(void) {   // g_watch_lock held; 1 when the kernel has the service
+    if (g_uffd != -2) return g_uffd >= 0;
+    g_uffd = -1;
+    int fd = (int)syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
+    if (fd < 0) return 0;
+    struct uffdio_api api = {.api = UFFD_API, .features = UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_WP_UNPOPULATED};
+    int pm = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+    if (ioctl(fd, UFFDIO_API, &api) || pm < 0) {
+        close(fd);
+        if (pm >= 0) close(pm);
+        return 0;
+    }
+    g_uffd = fd, g_pagemap = pm;
+    return 1;
+}
+
+static int watch_add(uint64_t addr, uint64_t size) {
+    pthread_mutex_lock(&g_watch_lock);
+    int ok = 0;
+    if (g_nwatched < WATCH_MAX && watch_open()) {
+        struct uffdio_register reg = {.range = {addr, size}, .mode = UFFDIO_REGISTER_MODE_WP};
+        struct uffdio_writeprotect wp = {.range = {addr, size}, .mode = UFFDIO_WRITEPROTECT_MODE_WP};
+        if (!ioctl(g_uffd, UFFDIO_REGISTER, &reg) && !ioctl(g_uffd, UFFDIO_WRITEPROTECT, &wp)) {
+            g_watched[g_nwatched].addr = addr, g_watched[g_nwatched].size = size, g_nwatched++;
+            ok = 1;
+        }
+    }
+    pthread_mutex_unlock(&g_watch_lock);
+    return ok;
+}
+
+static void watch_drop(uint64_t addr, uint64_t size) {
+    pthread_mutex_lock(&g_watch_lock);
+    for (int i = 0; i < g_nwatched; i++)
+        if (g_watched[i].addr == addr && g_watched[i].size == size) {
+            g_watched[i] = g_watched[--g_nwatched];
+            break;
+        }
+    pthread_mutex_unlock(&g_watch_lock);
+}
+
+static int watch_covers(uint64_t addr, uint64_t size) {   // [addr, addr+size) lies inside one watched reservation
+    int in = 0, fd;
+    pthread_mutex_lock(&g_watch_lock);
+    for (int i = 0; i < g_nwatched; i++)
+        if (addr >= g_watched[i].addr && addr + size <= g_watched[i].addr + g_watched[i].size) in = 1;
+    fd = g_pagemap;
+    pthread_mutex_unlock(&g_watch_lock);
+    return in ? fd : -1;
+}
+#endif
+
 int plat_reserve_at(uint64_t addr, uint64_t size, int watch) {
-    (void)watch;   // no write watch here: plat_written says so
     void *want = (void *)(uintptr_t)addr;
     void *p = mmap(want, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
     if (p == MAP_FAILED) return 0;
     if (p != want) munmap(p, size);   // a kernel without MAP_FIXED_NOREPLACE took it as a hint
+#ifdef __linux__
+    else if (watch)
+        (void)watch_add(addr, size);   // failing leaves the range unwatched: plat_written says so
+#else
+    (void)watch;
+#endif
     return p == want;
 }
 
-void plat_release(uint64_t addr, uint64_t size) { munmap((void *)(uintptr_t)addr, size); }
+void plat_release(uint64_t addr, uint64_t size) {
+#ifdef __linux__
+    watch_drop(addr, size);
+#endif
+    munmap((void *)(uintptr_t)addr, size);
+}
 
 int plat_commit(uint64_t addr, uint64_t size, int prot) {
     return mprotect((void *)(uintptr_t)addr, size, posix_prot(prot)) == 0;
@@ -547,8 +628,28 @@ int plat_is_free(uint64_t addr) {
 }
 
 uint64_t plat_written(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max, int reset) {
+#ifdef __linux__
+    int pm = watch_covers(addr, size);
+    if (pm < 0) return UINT64_MAX;   // not (all) inside a watched reservation, or the kernel cannot watch
+    uint64_t total = 0, start = addr, end = addr + size;
+    struct page_region vec[256];
+    while (start < end && total < max) {
+        struct pm_scan_arg a = {.size = sizeof a, .start = start, .end = end, .vec = (uintptr_t)vec,
+                                .vec_len = sizeof vec / sizeof vec[0], .max_pages = max - total,
+                                .category_mask = PAGE_IS_WRITTEN, .return_mask = PAGE_IS_WRITTEN,
+                                .flags = reset ? PM_SCAN_WP_MATCHING : 0};
+        long n = ioctl(pm, PAGEMAP_SCAN, &a);   // with a reset, only the pages it returns lose their mark
+        if (n < 0) return UINT64_MAX;
+        for (long i = 0; i < n; i++)
+            for (uint64_t pg = vec[i].start; pg < vec[i].end && total < max; pg += 0x1000) pages[total++] = pg;
+        if (a.walk_end <= start) break;
+        start = a.walk_end;
+    }
+    return total;
+#else
     (void)addr, (void)size, (void)pages, (void)max, (void)reset;
     return UINT64_MAX;
+#endif
 }
 
 uint64_t plat_resident(uint64_t addr, uint64_t size) {
