@@ -49,6 +49,9 @@
 //    must not be misrepresented as being the original software.
 // 3. This notice may not be removed or altered from any source
 //    distribution.
+#include <stdlib.h>
+#include <string.h>
+
 #include "oot2/nvn_tex.h"
 
 typedef struct { uint8_t bpb, bw, bh; } fmt_t;   // bytes per block, block width and height in texels
@@ -186,7 +189,7 @@ static uint64_t layer_bytes(const nvn_texdesc *d, unsigned dpl, int layered, uin
     return ls;
 }
 
-void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
+static void tex_layout_calc(const nvn_texdesc *d, nvn_texlayout *o) {
     fmt_t t = fmt_of(d->format);
     unsigned dpl;
     int layered;
@@ -239,6 +242,33 @@ void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
     o->align = sparse_of(d) ? SPARSE_TILE : 512;
 }
 
+// The layout of a description is a pure function of it, and the replay asks for it again for every use of a texture in every
+// submission (the check whether the CPU wrote it since), so the ones made are kept, by thread, under the description's bytes:
+// a description that differs in any bit (padding included) is a miss, never a wrong hit.
+enum { LAYOUT_CACHE = 1024 };
+typedef struct { nvn_texdesc d; nvn_texlayout L; int used; } LayoutEnt;
+typedef struct { nvn_texdesc d; unsigned level; uint64_t off; int used; } LevelEnt;
+static _Thread_local LayoutEnt *t_layout;
+static _Thread_local LevelEnt *t_level;
+
+static uint32_t desc_hash(const nvn_texdesc *d, unsigned extra) {
+    const uint8_t *p = (const uint8_t *)d;
+    uint32_t h = 2166136261u ^ extra;
+    for (size_t i = 0; i < sizeof *d; i++) h = (h ^ p[i]) * 16777619u;
+    return h;
+}
+
+void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
+    if (!t_layout) t_layout = calloc(LAYOUT_CACHE, sizeof *t_layout);
+    LayoutEnt *e = t_layout ? &t_layout[desc_hash(d, 0) % LAYOUT_CACHE] : NULL;
+    if (e && e->used && !memcmp(&e->d, d, sizeof *d)) {
+        *o = e->L;
+        return;
+    }
+    tex_layout_calc(d, o);
+    if (e) memcpy(&e->d, d, sizeof *d), e->L = *o, e->used = 1;
+}
+
 uint64_t nvn_tex_level_offset(const nvn_texdesc *d, unsigned level) {
     fmt_t t = fmt_of(d->format);
     unsigned dpl;
@@ -246,9 +276,14 @@ uint64_t nvn_tex_level_offset(const nvn_texdesc *d, unsigned level) {
     uint32_t w, h, z;
     shape(d, &dpl, &layered, &w, &h, &z);
     if (!t.bpb || nvn_tex_is_linear(d) || d->target == NVN_TEXTURE_TARGET_BUFFER) return 0;
+    if (!t_level) t_level = calloc(LAYOUT_CACHE, sizeof *t_level);
+    LevelEnt *e = t_level ? &t_level[desc_hash(d, level * 2654435761u) % LAYOUT_CACHE] : NULL;
+    if (e && e->used && e->level == level && !memcmp(&e->d, d, sizeof *d)) return e->off;
     nvn_texlayout L;
     nvn_tex_layout(d, &L);
-    return level_walk(d, level, dpl, w, h, z, L.tileH, L.tileD, t, 0);
+    uint64_t off = level_walk(d, level, dpl, w, h, z, L.tileH, L.tileD, t, 0);
+    if (e) memcpy(&e->d, d, sizeof *d), e->level = level, e->off = off, e->used = 1;
+    return off;
 }
 
 uint32_t nvn_tex_level_gobs(const nvn_texdesc *d, unsigned level) {

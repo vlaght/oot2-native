@@ -185,7 +185,8 @@ typedef struct VkReplayOps {
     int (*trace_tex)(uint32_t id, uint32_t *format, int *astc);
 } VkReplayOps;
 #define VKR_QUERIES 512u       // occlusion queries in one pool
-#define VKR_QUERY_POOLS 8u     // pools a frame may take (one query per pass while counting, one more per report)
+#define VKR_QUERY_POOLS 32u    // pools the trace keeps a note of a query in (vk_replay_trace.c); a frame may take more
+#define VKR_QUERY_POOLS_MAX 4096u   // pools a frame may take (one query per pass while counting, one more per report): over two million queries; the list a frame keeps grows with its need, so the 3D scenes of the prologue (more than 4096 queries) are served
 
 // Use these ops from now on (NULL: the device's, vkr_device_ops). A test's ops stay valid while it replays.
 void vkr_set_ops(const VkReplayOps *ops);

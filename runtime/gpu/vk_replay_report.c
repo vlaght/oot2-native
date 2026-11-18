@@ -71,7 +71,7 @@ typedef struct {
 // What a frame leaves to the completion thread.
 typedef struct {
     const VkReplayOps *ops;
-    VkQueryPool pools[VKR_QUERY_POOLS];   // query q is query q % VKR_QUERIES of pools[q / VKR_QUERIES]
+    VkQueryPool *pools;                   // np of them: query q is query q % VKR_QUERIES of pools[q / VKR_QUERIES]
     uint32_t np, nq, n;                   // pools taken, queries used, entries
     void *trace;                          // the trace's note of each query (vkrt_queries_take), NULL with the trace off
     Entry e[];
@@ -81,8 +81,8 @@ typedef struct {
 static struct {
     Entry *e;
     uint32_t n, cap;
-    VkQueryPool pools[VKR_QUERY_POOLS];
-    uint32_t np, nq;
+    VkQueryPool *pools;   // grown by the frame's need (np_cap of them)
+    uint32_t np, np_cap, nq;
     int open;            // the query active in the open pass, -1 for none
 } R = {.open = -1};
 
@@ -167,8 +167,14 @@ void vkr_report_draw(void) {
     if (!g_counting || R.open >= 0 || vkr_no_queries) return;
     const VkReplayOps *ops = vkr_frame_ops();
     if (R.nq == R.np * VKR_QUERIES) {
-        if (R.np == VKR_QUERY_POOLS)
-            vkr_stop("more than %u occlusion queries in one submission", VKR_QUERY_POOLS * VKR_QUERIES);
+        if (R.np == VKR_QUERY_POOLS_MAX)
+            vkr_stop("more than %u occlusion queries in one submission", VKR_QUERY_POOLS_MAX * VKR_QUERIES);
+        if (R.np == R.np_cap) {   // the list of the frame's pools grows with its need
+            uint32_t cap = R.np_cap ? 2 * R.np_cap : 8;
+            VkQueryPool *g = realloc(R.pools, sizeof *g * cap);
+            if (!g) rt_fatal("gfx: vulkan: out of memory for %u occlusion query pools", cap);
+            R.pools = g, R.np_cap = cap;
+        }
         R.pools[R.np] = ops->queries ? ops->queries(vkr_frame_value()) : VK_NULL_HANDLE;
         if (!R.pools[R.np]) vkr_stop("no occlusion query pool for the samples-passed counter");
         R.np++;
@@ -310,7 +316,8 @@ static void wait_event(const p_wait_event *p) {
 static void complete(void *arg, uint64_t value) {
     (void)value;
     Done *d = arg;
-    uint64_t res[VKR_QUERY_POOLS * VKR_QUERIES];
+    uint64_t *res = malloc(sizeof *res * ((size_t)d->np * VKR_QUERIES + 1));   // one more, for a frame with no pool
+    if (!res) rt_fatal("gfx: vulkan: out of memory for the results of %u occlusion queries", d->nq);
     for (uint32_t i = 0; i < d->np; i++) {   // and each pool goes back
         uint32_t n = d->nq - i * VKR_QUERIES;
         d->ops->query_results(d->pools[i], n < VKR_QUERIES ? n : VKR_QUERIES, res + i * VKR_QUERIES);
@@ -353,6 +360,8 @@ static void complete(void *arg, uint64_t value) {
     while (next < d->nq) g_running += res[next++];   // counted, for a report in a later frame
     g_st.queries += d->nq;
     plat_mutex_unlock(&g_lock);
+    free(res);
+    free(d->pools);
     free(d);
 }
 
@@ -363,7 +372,9 @@ void vkr_report_frame_end(void) {
     if (!d) rt_fatal("gfx: vulkan: out of memory for a frame's reports and events");
     d->ops = vkr_frame_ops(), d->np = R.np, d->nq = R.nq, d->n = R.n;
     d->trace = vkrt_on ? vkrt_queries_take(R.nq) : NULL;
-    memcpy(d->pools, R.pools, sizeof d->pools);
+    d->pools = malloc(sizeof *d->pools * (R.np ? R.np : 1));
+    if (!d->pools) rt_fatal("gfx: vulkan: out of memory for a frame's occlusion query pools");
+    if (R.np) memcpy(d->pools, R.pools, sizeof *d->pools * R.np);
     if (R.n) memcpy(d->e, R.e, sizeof d->e[0] * R.n);
     vkrec_effect(complete, d);
     R.n = 0, R.np = 0, R.nq = 0;

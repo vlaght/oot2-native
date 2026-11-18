@@ -734,6 +734,29 @@ static void trace_readback(void) {
         trace_barrier();
         vkrt_rb_queued(&want, level, layer + (uint32_t)at.z, host, bytes);
     }
+    // the depth target of a pass (a 32-bit float one), read as attachment 255
+    if (S.rt.depth.present && (F.depth.aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && F.depth.format == VK_FORMAT_D32_SFLOAT) {
+        const nvn_tex_rec *t = &S.rt.depth;
+        VkrtRbWant want = {.att = 255, .width = F.depth.width, .height = F.depth.height, .layers = F.depth.layers,
+                           .format = F.depth.format};
+        VkrImage img;
+        uint64_t bytes = (uint64_t)F.depth.width * F.depth.height * 4;
+        if (bytes <= TRACE_RB_MAX && vkrt_rb_wants(&want) && F.ops->image && F.ops->scratch && F.ops->image(t, F.value, &img) &&
+            img.samples <= 1 && (img.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+            uint32_t level = t->has_view && t->view.set_levels ? t->view.base_level : 0;
+            uint32_t layer = t->has_view && t->view.set_layers ? t->view.min_layer : 0;
+            VkBuffer buf;
+            VkDeviceSize off;
+            void *host = F.ops->scratch(F.value, (uint32_t)bytes, 16, &buf, &off);
+            VkBufferImageCopy cp = {.bufferOffset = off,
+                                    .imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, level, layer, 1},
+                                    .imageExtent = {F.depth.width, F.depth.height, 1}};
+            trace_barrier();
+            vkrec_CopyImageToBuffer(img.image, buf, &cp);
+            trace_barrier();
+            vkrt_rb_queued(&want, level, layer, host, bytes);
+        }
+    }
 }
 
 static void pass_begin_body(void);
@@ -1011,6 +1034,7 @@ static VkpStage replay_stage(const nvn_stage *s) {
     BT_TIME(BT_S1_DIGEST, ledger_track_answers_digest(&S.track, s->kind, digest));
     VkpStage stage = {.key = s->key, .shape = s};
     vkp_stage_set_ledger_digest(&stage, digest);
+    vkp_stage_resolve_projection(&stage, &S.track, s->kind);   // a state the map has not seen is served by its projection
     return stage;
 }
 
@@ -1359,9 +1383,10 @@ static void vertex_input_body(const ShaderBinds *vb) {
         if (!vkn_vertex_format((int)a.fmt, &fmt, &bytes, &type))
             stop("vertex attribute %u has NVN format %#x, which has no vertex format", loc, (unsigned)a.fmt);
         if ((type == VKN_ATTR_FLOAT) != (vb->vin[i].type == SHD_FLOAT) ||
-            (type != VKN_ATTR_FLOAT && (type == VKN_ATTR_SINT) != (vb->vin[i].type == SHD_SINT)))
+            (type != VKN_ATTR_FLOAT && (type == VKN_ATTR_SINT) != (vb->vin[i].type == SHD_SINT))) {
             stop_answer(P.id[ST_VS]->key, "vertex attribute %u (NVN format %#x) is of another scalar type than the module's "
                         "input", loc, (unsigned)a.fmt);
+        }
         in.a[in.na++] = (VkVertexInputAttributeDescription2EXT){
             .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT, .location = loc, .binding = a.stream,
             .format = fmt, .offset = a.offset};
@@ -2250,7 +2275,7 @@ uint64_t vkr_submit(const uint64_t *handles, int n) {
     pass_end();
     movie_unclosed("no blit program came before the end of this submission");
     if (ops->frame_end) ops->frame_end(value);
-    vkr_report_frame_end();   // after the frame's end: its events and reports follow the backing map's write-backs
+    vkr_report_frame_end();
     if (RC_ON()) vkrc_submit_end(F.draws);
     if (vkrt_on) vkrt_submit_end();
     g_stats.frames++;

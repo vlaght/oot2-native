@@ -219,13 +219,29 @@ static int cmp_slot_text(const void *a, const void *b) {
     return strcmp(x, y);
 }
 
+// The slots 0 to LEDGER_TEX_SLOTS - 1 in the order of the text of their numbers ("0", "1", "10", "11", ..., "2"), which
+// json.dumps(sort_keys=True) writes them in. The order does not change, so it is made once, not by a sort for every map.
+static int g_slot_order[LEDGER_TEX_SLOTS];
+static int g_slot_order_ready;
+
+static void slot_order_init(void) {
+    if (__atomic_load_n(&g_slot_order_ready, __ATOMIC_ACQUIRE)) return;
+    int o[LEDGER_TEX_SLOTS];
+    for (int i = 0; i < LEDGER_TEX_SLOTS; i++) o[i] = i;
+    qsort(o, LEDGER_TEX_SLOTS, sizeof o[0], cmp_slot_text);
+    memcpy(g_slot_order, o, sizeof o);
+    __atomic_store_n(&g_slot_order_ready, 1, __ATOMIC_RELEASE);
+}
+
 // One answer map, keys sorted as the text of their numbers (json.dumps(sort_keys=True) sorts strings).
 static int put_map(Buf *b, int first, const char *name, const uint8_t *v, int n, int kind, const RowBin *r) {
     int slots[LEDGER_TEX_SLOTS], k = 0;
-    for (int i = 0; i < n; i++)
-        if (v[i]) slots[k++] = i;
+    slot_order_init();
+    for (int oi = 0; oi < LEDGER_TEX_SLOTS; oi++) {
+        int i = g_slot_order[oi];
+        if (i < n && v[i]) slots[k++] = i;
+    }
     if (!k) return first;
-    qsort(slots, (size_t)k, sizeof slots[0], cmp_slot_text);
     bput(b, "%s\"%s\":{", first ? "" : ",", name);
     for (int i = 0; i < k; i++) {
         int s = slots[i];
@@ -570,10 +586,334 @@ void ledger_track_answers_digest(LedgerTrack *t, int kind, uint8_t out[32]) {
     memcpy(r.img_fmt, t->img_fmt[s], sizeof r.img_fmt);
     if (s == 0) memcpy(r.attr, t->attr, sizeof r.attr);
     if (s == 1) memcpy(r.fout, t->fout, sizeof r.fout);
+    // A draw's state repeats the state of a draw before it far more often than it is new: the digest of the states seen
+    // is kept by thread (the tracker of the front end and the replay's run on different threads), so the text and the
+    // SHA-256 are made once for each state, not for each draw.
+    enum { DCACHE = 2048 };
+    typedef struct { RowBin r; uint8_t digest[32]; int used; } DEnt;
+    static _Thread_local DEnt *t_dcache;
+    if (!t_dcache) t_dcache = calloc(DCACHE, sizeof *t_dcache);
+    DEnt *ce = NULL;
+    if (t_dcache) {
+        ce = &t_dcache[fnv(&r, sizeof r) % DCACHE];
+        if (ce->used && !memcmp(&ce->r, &r, sizeof r)) {
+            memcpy(out, ce->digest, 32);
+            if (RC_ON()) digest_count_recompute(slot, &r, out);
+            memcpy(t->answers_digest[slot], out, 32);
+            t->answers_digest_valid |= (uint8_t)(1u << slot);
+            return;
+        }
+    }
     BT_TIME(BT_S1_TEXT, char *text = answers_text(&r, out); free(text));
+    if (ce) ce->r = r, memcpy(ce->digest, out, 32), ce->used = 1;
     if (RC_ON()) digest_count_recompute(slot, &r, out);
     memcpy(t->answers_digest[slot], out, 32);
     t->answers_digest_valid |= (uint8_t)(1u << slot);
+}
+
+// ---------- the projection (see oot2/ledger.h)
+// A small reader of the description's JSON: only the few members the reads come from, everything else skipped.
+typedef struct { const char *p, *e; } Jp;
+
+static void jws(Jp *j) {
+    while (j->p < j->e && (*j->p == ' ' || *j->p == '\n' || *j->p == '\t' || *j->p == '\r')) j->p++;
+}
+
+static int jstr(Jp *j, char *out, size_t cap) {   // a string into out (cut to cap - 1), 1 on success
+    jws(j);
+    if (j->p >= j->e || *j->p != '"') return 0;
+    j->p++;
+    size_t n = 0;
+    while (j->p < j->e && *j->p != '"') {
+        char c = *j->p++;
+        if (c == '\\' && j->p < j->e) {
+            c = *j->p++;
+            if (c == 'n') c = '\n';
+            else if (c == 't') c = '\t';
+            else if (c == 'u') {   // \uXXXX: the descriptions are ASCII; skip the four digits
+                for (int k = 0; k < 4 && j->p < j->e; k++) j->p++;
+                c = '?';
+            }
+        }
+        if (out && n + 1 < cap) out[n++] = c;
+    }
+    if (j->p >= j->e) return 0;
+    j->p++;
+    if (out) out[n] = 0;
+    return 1;
+}
+
+static int jskip(Jp *j);
+
+static int jnum(Jp *j, long *v) {   // an integer, 1 on success
+    jws(j);
+    const char *q = j->p;
+    int neg = 0;
+    if (q < j->e && *q == '-') neg = 1, q++;
+    if (q >= j->e || *q < '0' || *q > '9') return 0;
+    long x = 0;
+    while (q < j->e && *q >= '0' && *q <= '9') x = x * 10 + (*q++ - '0');
+    if (q < j->e && (*q == '.' || *q == 'e' || *q == 'E')) return 0;   // not an integer
+    j->p = q;
+    *v = neg ? -x : x;
+    return 1;
+}
+
+static int jskip(Jp *j) {   // any one value
+    jws(j);
+    if (j->p >= j->e) return 0;
+    char c = *j->p;
+    if (c == '"') return jstr(j, NULL, 0);
+    if (c == '{' || c == '[') {
+        char close = c == '{' ? '}' : ']';
+        j->p++;
+        jws(j);
+        if (j->p < j->e && *j->p == close) return j->p++, 1;
+        for (;;) {
+            if (c == '{') {
+                if (!jstr(j, NULL, 0)) return 0;
+                jws(j);
+                if (j->p >= j->e || *j->p++ != ':') return 0;
+            }
+            if (!jskip(j)) return 0;
+            jws(j);
+            if (j->p >= j->e) return 0;
+            if (*j->p == ',') { j->p++; continue; }
+            if (*j->p == close) return j->p++, 1;
+            return 0;
+        }
+    }
+    while (j->p < j->e && *j->p != ',' && *j->p != '}' && *j->p != ']' && *j->p != ' ' && *j->p != '\n') j->p++;   // a number, true, false, null
+    return 1;
+}
+
+// The member loop of an object: calls cb for each key, with the reader after the colon; cb returns 1 when it consumed the value.
+typedef int (*JMember)(void *u, const char *key, Jp *j);
+static int jobject(Jp *j, JMember cb, void *u) {
+    jws(j);
+    if (j->p >= j->e || *j->p != '{') return 0;
+    j->p++;
+    jws(j);
+    if (j->p < j->e && *j->p == '}') return j->p++, 1;
+    for (;;) {
+        char key[40];
+        if (!jstr(j, key, sizeof key)) return 0;
+        jws(j);
+        if (j->p >= j->e || *j->p++ != ':') return 0;
+        const char *before = j->p;
+        if (!cb(u, key, j)) {
+            j->p = before;
+            if (!jskip(j)) return 0;
+        }
+        jws(j);
+        if (j->p >= j->e) return 0;
+        if (*j->p == ',') { j->p++; jws(j); continue; }
+        if (*j->p == '}') return j->p++, 1;
+        return 0;
+    }
+}
+
+typedef struct {
+    LedgerReads *r;
+    int ps, dropped;
+    // the member being read: a query or a vertex input or an output
+    char kind[24], answer[40];
+    long slot, islot, loc;
+    int has_slot, has_islot, has_loc;
+    int stage_known;
+} RdCtx;
+
+static uint8_t name_index(const char *const *names, int n, const char *answer) {   // 0xFF: no such name
+    for (int i = 1; i < n; i++)
+        if (!strcmp(names[i], answer)) return (uint8_t)i;
+    return 0xFF;
+}
+
+// An answer for one slot: the first sets the default, a different second makes it "several" (0xFF, never equal)
+static void note_def(uint8_t *read, uint8_t *def, uint8_t code) {
+    if (!*read) *read = 1, *def = code;
+    else if (*def != code) *def = 0xFF;
+}
+
+static int rd_query_member(void *u, const char *key, Jp *j) {
+    RdCtx *c = u;
+    if (!strcmp(key, "kind")) return jstr(j, c->kind, sizeof c->kind);
+    if (!strcmp(key, "answer")) return jstr(j, c->answer, sizeof c->answer);
+    if (!strcmp(key, "slot")) return c->has_slot = jnum(j, &c->slot);
+    if (!strcmp(key, "image_slot")) return c->has_islot = jnum(j, &c->islot);
+    return 0;
+}
+
+static int rd_read_queries(RdCtx *c, Jp *j) {
+    jws(j);
+    if (j->p >= j->e || *j->p != '[') return 0;
+    j->p++;
+    jws(j);
+    if (j->p < j->e && *j->p == ']') return j->p++, 1;
+    for (;;) {
+        jws(j);
+        c->kind[0] = c->answer[0] = 0, c->has_slot = c->has_islot = 0;
+        if (j->p < j->e && *j->p == '{') {
+            if (!jobject(j, rd_query_member, c)) return 0;
+            if (c->has_slot && c->has_islot) {
+                LedgerReads *r = c->r;
+                if (!strcmp(c->kind, "sampler_type")) {
+                    uint8_t code = name_index(TYPE_NAME, T_COUNT, c->answer);
+                    if (c->islot >= 0 && c->islot < LEDGER_IMG_SLOTS) note_def(&r->img_type_read[c->islot], &r->img_type_def[c->islot], code);
+                    else if (c->islot < 0 && c->slot >= 0 && c->slot < LEDGER_TEX_SLOTS) note_def(&r->tex_read[c->slot], &r->tex_def[c->slot], code);
+                } else if (!strcmp(c->kind, "texture_format") && c->islot >= 0 && c->islot < LEDGER_IMG_SLOTS) {
+                    int i = (int)c->islot;
+                    if (!r->img_fmt_read[i]) r->img_fmt_read[i] = 1, snprintf(r->img_fmt_def[i], sizeof r->img_fmt_def[i], "%s", c->answer);
+                    else if (strcmp(r->img_fmt_def[i], c->answer)) r->img_fmt_def[i][0] = 0;
+                }
+            }
+        } else if (!jskip(j)) {
+            return 0;
+        }
+        jws(j);
+        if (j->p >= j->e) return 0;
+        if (*j->p == ',') { j->p++; continue; }
+        if (*j->p == ']') return j->p++, 1;
+        return 0;
+    }
+}
+
+static int rd_vin_member(void *u, const char *key, Jp *j) {
+    RdCtx *c = u;
+    if (!strcmp(key, "location")) return c->has_loc = jnum(j, &c->loc);
+    if (!strcmp(key, "answer")) return jstr(j, c->answer, sizeof c->answer);
+    return 0;
+}
+
+static int rd_out_member(void *u, const char *key, Jp *j) {
+    RdCtx *c = u;
+    if (!strcmp(key, "location")) return c->has_loc = jnum(j, &c->loc);
+    return 0;
+}
+
+static int rd_iface_member(void *u, const char *key, Jp *j) {
+    RdCtx *c = u;
+    if (!strcmp(key, "outputs")) {
+        jws(j);
+        if (j->p >= j->e || *j->p != '[') return 0;
+        j->p++;
+        jws(j);
+        if (j->p < j->e && *j->p == ']') return j->p++, 1;
+        for (;;) {
+            jws(j);
+            c->has_loc = 0;
+            if (j->p < j->e && *j->p == '{') {
+                if (!jobject(j, rd_out_member, c)) return 0;
+                if (c->has_loc && c->loc >= 0 && c->loc < LEDGER_TARGETS) c->r->fout_read |= 1u << c->loc;
+            } else if (!jskip(j)) {
+                return 0;
+            }
+            jws(j);
+            if (j->p >= j->e) return 0;
+            if (*j->p == ',') { j->p++; continue; }
+            if (*j->p == ']') return j->p++, 1;
+            return 0;
+        }
+    }
+    return 0;
+}
+
+static int rd_top_member(void *u, const char *key, Jp *j) {
+    RdCtx *c = u;
+    char word[16];
+    if (!strcmp(key, "stage")) {
+        if (!jstr(j, word, sizeof word)) return 0;
+        c->ps = !strcmp(word, "ps");
+        return 1;
+    }
+    if (!strcmp(key, "queries_dropped")) {
+        jws(j);
+        c->dropped = j->p < j->e && *j->p == 't';
+        return jskip(j);
+    }
+    if (!strcmp(key, "queries")) {
+        jws(j);
+        if (j->p < j->e && *j->p == 'n') return 0;   // null: nothing to read, skipped
+        return rd_read_queries(c, j);
+    }
+    if (!strcmp(key, "vertex_inputs")) {
+        jws(j);
+        if (j->p >= j->e || *j->p != '[') return 0;
+        j->p++;
+        jws(j);
+        if (j->p < j->e && *j->p == ']') return j->p++, 1;
+        for (;;) {
+            jws(j);
+            c->has_loc = 0, c->answer[0] = 0;
+            if (j->p < j->e && *j->p == '{') {
+                if (!jobject(j, rd_vin_member, c)) return 0;
+                if (c->has_loc && c->loc >= 0 && c->loc < LEDGER_ATTRS)
+                    note_def(&c->r->attr_read[c->loc], &c->r->attr_def[c->loc], name_index(CLASS_NAME, 4, c->answer));
+            } else if (!jskip(j)) {
+                return 0;
+            }
+            jws(j);
+            if (j->p >= j->e) return 0;
+            if (*j->p == ',') { j->p++; continue; }
+            if (*j->p == ']') return j->p++, 1;
+            return 0;
+        }
+    }
+    if (!strcmp(key, "interface")) {
+        jws(j);
+        if (j->p < j->e && *j->p == 'n') return 0;
+        return jobject(j, rd_iface_member, c);
+    }
+    return 0;
+}
+
+int ledger_reads_parse(const char *desc, size_t n, LedgerReads *out) {
+    memset(out, 0, sizeof *out);
+    RdCtx c = {.r = out};
+    Jp j = {desc, desc + n};
+    if (!jobject(&j, rd_top_member, &c)) return 0;
+    if (c.dropped) return 0;   // the record overflowed: prepare reads the declared slots instead, which is not done here
+    // the pixel module's outputs are read only by a pixel module
+    if (!c.ps) out->fout_read = 0;
+    out->valid = 1;
+    return 1;
+}
+
+int ledger_track_projected_digest(LedgerTrack *t, int kind, const LedgerReads *rd, uint8_t out[32], char **text_out) {
+    memset(out, 0, 32);
+    if (text_out) *text_out = NULL;
+    int slot = tracker_slot(kind);
+    if (slot < 0 || !rd->valid) return 0;
+    int s = KIND_STAGE[slot];
+    RowBin r;
+    memset(&r, 0, sizeof r);
+    for (int i = 0; i < LEDGER_TEX_SLOTS; i++) {
+        uint8_t v = t->tex[s][i];
+        if (v && rd->tex_read[i] && rd->tex_def[i] != v) r.tex[i] = v;
+    }
+    for (int i = 0; i < LEDGER_IMG_SLOTS; i++) {
+        uint8_t v = t->img_type[s][i];
+        if (!v) continue;
+        int type_differs = rd->img_type_read[i] && rd->img_type_def[i] != v;
+        int fmt_differs = rd->img_fmt_read[i] && strcmp(rd->img_fmt_def[i], image_format_name(t->img_fmt[s][i]));
+        if (type_differs || fmt_differs) r.img_type[i] = v, r.img_fmt[i] = t->img_fmt[s][i];
+    }
+    if (s == 0)
+        for (int i = 0; i < LEDGER_ATTRS; i++) {
+            uint8_t v = t->attr[i];
+            if (v && rd->attr_read[i] && rd->attr_def[i] != v) r.attr[i] = v;
+        }
+    if (s == 1)
+        for (int i = 0; i < LEDGER_TARGETS; i++) {
+            uint8_t v = t->fout[i];
+            if (v && (rd->fout_read >> i & 1) && v != A_FLOAT) r.fout[i] = v;
+        }
+    char *text = answers_text(&r, out);
+    int any = 0;
+    for (int i = 0; i < 32; i++) any |= out[i] != 0;
+    if (any && text_out) *text_out = text;
+    else free(text);
+    return any;
 }
 
 void ledger_track_op(LedgerTrack *t, const op_hdr *h) {

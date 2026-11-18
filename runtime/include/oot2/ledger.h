@@ -31,6 +31,7 @@
 // Writing. Rows are kept in memory, deduplicated, while the frame runs; ledger_flush writes the file at a safe point
 // and refuses on the frame path (inside a submission).
 #pragma once
+#include <stddef.h>
 #include <stdint.h>
 
 #include "nvn_obj.h"
@@ -67,6 +68,29 @@ void ledger_track_op(LedgerTrack *t, const op_hdr *r);
 // written into ledger.jsonl, before prepare projects answers onto the slots the module reads. Cached until that
 // stage's relevant tracker state changes.
 void ledger_track_answers_digest(LedgerTrack *t, int kind, uint8_t out[32]);
+
+// ---- the projection. prepare keeps a variant of a module only under the answers the module reads and the default
+// translation did not use (tools/prepare/ledger.py reads_of and project), and maps the ledger's full digest of each row to
+// that projected digest. A state the ledger has not seen has no row in the map, yet the same projection says which
+// variant it needs, so the replay computes it here from the module's description and the tracker, as prepare does.
+//
+// What a module reads, from the description of its default translation: the slots it asks about and the answer it was
+// translated with (0xFF when it used several, which no single current answer equals).
+typedef struct LedgerReads {
+    int valid;                                  // 0: the description's record of queries overflowed or is unreadable
+    uint8_t tex_read[LEDGER_TEX_SLOTS], tex_def[LEDGER_TEX_SLOTS];
+    uint8_t img_type_read[LEDGER_IMG_SLOTS], img_type_def[LEDGER_IMG_SLOTS];
+    uint8_t img_fmt_read[LEDGER_IMG_SLOTS];
+    char img_fmt_def[LEDGER_IMG_SLOTS][32];     // "" when several answers were used
+    uint8_t attr_read[LEDGER_ATTRS], attr_def[LEDGER_ATTRS];
+    uint32_t fout_read;                         // a bit per colour target the pixel module writes
+} LedgerReads;
+// Read the description text (JSON, n bytes) of a default translation. 0 when it cannot be read as above.
+int ledger_reads_parse(const char *desc, size_t n, LedgerReads *out);
+// The digest of the answers of the current stage that its module reads and its default translation did not use: 1 and the
+// SHA-256 of their canonical text when there are any (the variant's digest), 0 when there are none (the base module).
+// With text_out, the canonical JSON object of those answers too ({"attr":{"6":"uint"}}, malloc'd, the caller frees it).
+int ledger_track_projected_digest(LedgerTrack *t, int kind, const LedgerReads *rd, uint8_t out[32], char **text_out);
 
 // ---- the rows
 // The folder the file lives in (the player's output folder): rows already there are loaded, so a new run adds to them.

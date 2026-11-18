@@ -543,6 +543,8 @@ void vkrt_rb_skipped(const VkrtRbWant *w, const char *why) {
 
 typedef struct RbJob {
     char head[256];
+    char name[200];    // the file name of the raw dump (OOT2_REPLAY_DUMP_DIR), or empty
+    uint64_t bytes;
     VkFormat fmt;
     uint64_t texels;
     const void *data;
@@ -554,6 +556,16 @@ static void rb_done(void *arg, uint64_t value) {
     RbJob *j = arg;
     VkrtScan sc;
     char buf[ROW_MAX];
+    const char *dump_dir = getenv("OOT2_REPLAY_DUMP_DIR");   // a development aid: the raw texels, one file per readback
+    if (dump_dir && j->name[0]) {
+        char path[600];
+        snprintf(path, sizeof path, "%s/%s", dump_dir, j->name);
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            fwrite(j->data, 1, (size_t)j->bytes, f);
+            fclose(f);
+        }
+    }
     int n = (int)sn(buf, sizeof buf, "%s\ttexels=%llu", j->head, (unsigned long long)j->texels);
     if (!vkrt_scan(j->data, j->fmt, j->texels, j->thr, &sc)) {
         snprintf(buf + n, sizeof buf - (size_t)n, "\tskipped=no_decoder_for_format");
@@ -580,7 +592,11 @@ void vkrt_rb_queued(const VkrtRbWant *w, uint32_t level, uint32_t layer, const v
     if (!j) return;
     rb_head(j->head, sizeof j->head, w, level, layer);
     j->fmt = w->format, j->data = data, j->thr = Rb.thr;
+    j->bytes = bytes;
+    snprintf(j->name, sizeof j->name, "p%llu_pass%u_att%u_%ux%u_fmt%d.raw", (unsigned long long)T.present, T.passes, w->att,
+             w->width, w->height, (int)w->format);
     uint32_t bpt = vkrt_texel_bytes(w->format);
+    if (!bpt && w->format == VK_FORMAT_D32_SFLOAT) bpt = 4;
     j->texels = bpt ? bytes / bpt : 0;
     vkrec_effect(rb_done, j);
 }
