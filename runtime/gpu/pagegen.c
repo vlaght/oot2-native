@@ -35,6 +35,7 @@
 typedef struct Piece {
     uint64_t page[PAGES_PER_PIECE];
     uint64_t gpu[PAGES_PER_PIECE];        // the stamp a GPU write-back gave the page (pagegen_mark_gpu); 0 for none
+    uint8_t ever[PAGES_PER_PIECE];        // 1 once a GPU write-back covered the page whole, CPU-written meanwhile or not
     uint64_t region[REGIONS_PER_PIECE];   // the newest stamp of each 2 MiB region
 } Piece;
 
@@ -109,6 +110,14 @@ uint64_t pagegen_scan(uint64_t lo, uint64_t hi) {
     return tracked ? g : UINT64_MAX;
 }
 
+int pagegen_watch_is_precise(void) {
+#ifdef __linux__
+    return g_src == NULL;   // not a test's stand-in
+#else
+    return 0;
+#endif
+}
+
 uint64_t pagegen_mark(uint64_t lo, uint64_t hi) {
     lo &= ~(PAGEGEN_PAGE - 1);
     hi = (hi + PAGEGEN_PAGE - 1) & ~(PAGEGEN_PAGE - 1);
@@ -132,7 +141,8 @@ uint64_t pagegen_mark_gpu(uint64_t lo, uint64_t hi) {
         g_st.marks++, g_st.mark_pages += (ahi - alo) >> PAGE_SHIFT;
         if (glo < ghi) {
             for (uint64_t a = glo; a < ghi; a += PAGEGEN_PAGE)
-                piece(a, 1)->gpu[(a >> PAGE_SHIFT) & (PAGES_PER_PIECE - 1)] = g;
+                piece(a, 1)->gpu[(a >> PAGE_SHIFT) & (PAGES_PER_PIECE - 1)] = g,
+                    piece(a, 1)->ever[(a >> PAGE_SHIFT) & (PAGES_PER_PIECE - 1)] = 1;
             // The runtime's own copy dirtied these pages in the write watch: take that mark away (its pages are not
             // stamped again, so they stay GPU-current), or the next query would report the write-back as a CPU write.
             PagegenSource src = source();
@@ -174,6 +184,7 @@ uint64_t pagegen_mark_gpu_direct(uint64_t lo, uint64_t hi, uint64_t since, uint6
         uint64_t k = (a >> PAGE_SHIFT) & (PAGES_PER_PIECE - 1);
         // A page stamped after `since` by a write-back (its stamp is its GPU stamp) is another submission's GPU write,
         // not the CPU's. The test comes before the stamp, which would hide it.
+        p->ever[k] = 1;
         int cpu_wrote = !tracked || (p->page[k] > since && p->page[k] != p->gpu[k]);
         stamp(a, g);
         if (cpu_wrote) {
@@ -197,6 +208,14 @@ uint64_t pagegen_gpu_stamp(uint64_t page) {
     uint64_t g = p ? p->gpu[(page >> PAGE_SHIFT) & (PAGES_PER_PIECE - 1)] : 0;
     plat_mutex_unlock(&g_lock);
     return g;
+}
+
+int pagegen_gpu_ever(uint64_t page) {
+    plat_mutex_lock(&g_lock);
+    const Piece *p = page < RT_ADDRESS_LIMIT ? piece(page, 0) : NULL;
+    int e = p ? p->ever[(page >> PAGE_SHIFT) & (PAGES_PER_PIECE - 1)] : 0;
+    plat_mutex_unlock(&g_lock);
+    return e;
 }
 
 uint64_t pagegen_now(void) {

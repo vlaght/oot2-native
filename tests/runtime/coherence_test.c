@@ -2050,8 +2050,50 @@ static void case_raw_diag_birth(void) {
     resolve(p - 0x10000, 4, v);
     printf("raw_diag_birth: p=%#llx T=%#llx P=%#llx v0=%llu v1=%llu v=%llu\n", (ull)p, (ull)T, (ull)P, (ull)v0,
            (ull)v1, (ull)v);
-    resolve(p - 0x2800, 0x1000, v);   // across the import's new end and the mirror's new start
+    resolve(p - 0x2800, 0x1100, v);   // across the import's new end and the mirror's new start, and 0x100 bytes into what the submission read there
     printf("returned\n");
+}
+
+// Two binds side by side in memory share the page between them: the mirror of the first one grew in place, and the next bind
+// ends in that page, in bytes the first never reached. The bind's import takes the page from the mirror (the growth over it is
+// refused: another backing lies there), nothing recorded before reaches a byte the import reaches, and no page has two backings.
+// The bytes a mirror gives up this way were read, not written, by the submission: a write declared into the mirror stops it.
+static void case_raw_share_page(void) {
+    setup(64 * MiB, 0);
+    backing_set_mirror_hook(want_all);
+    uint64_t p = g_heap + 8 * MiB, T = p + 0x80000, P = p + 0x100000;
+    pool(p - 1 * MiB, 16 * MiB);
+    cpu_fill(p, 256 * KiB, 0xAAAAAAAAu);
+    cpu_fill(T, 256 * KiB, 0xCCCCCCCCu);
+    cpu_fill(P, 128 * KiB, 0xDDDDDDDDu);
+    uint64_t v0 = sub_begin();
+    CHECK(resolve(p, 4, v0).kind == BACKING_MIRROR && resolve(T, 4, v0).kind == BACKING_MIRROR);
+    sub_end(v0);
+    gpu_run(v0, NULL);
+    cpu_fill(p - 0x20000, 0x20000, 0xBBBBBBBBu);
+    uint64_t v1 = sub_begin();
+    backing_raw_begin(v1);
+    CHECK(resolve(P, 128 * KiB, v1).kind == BACKING_IMPORT);
+    sub_end(v1);
+    gpu_run(v1, NULL);
+    uint64_t v = sub_begin();
+    backing_raw_begin(v);
+    resolve(T + 0x3F000, 0x20000, v);
+    resolve(p + 0x3E00, 0xC00, v);
+    CHECK(resolve(p - 0x1800, 0x5800, v).kind == BACKING_MIRROR);   // the mirror of p grows over two pages
+    resolve(p - 0x10000, 4, v);
+    BackingRef last = resolve(p - 0x2800, 0x1000, v);   // ends where the submission's reads of the mirror begin
+    CHECK(last.kind == BACKING_IMPORT);
+    BackingRun *runs;
+    uint64_t rv;
+    int n = backing_raw_runs(&runs, &rv);
+    for (uint64_t a = p - 0x20000; a < p + 0x40000; a += PG) CHECK(runs_cover(runs, n, a) == 1);   // no page twice
+    CHECK(run_at(runs, n, p - 0x2000) && run_at(runs, n, p - 0x2000)->kind == BACKING_IMPORT);   // the shared page went
+    CHECK(run_at(runs, n, p - 0x1000) && run_at(runs, n, p - 0x1000)->kind == BACKING_MIRROR);   // the mirror keeps the rest
+    free(runs);
+    sub_end(v);
+    gpu_run(v, NULL);
+    done("raw_share_page");
 }
 
 // ---------- the events a stop prints, and the dry evaluation of the growth a bind's cut makes unnecessary
@@ -3212,7 +3254,7 @@ int main(int argc, char **argv) {
         {"raw_grow_over_total", case_raw_grow_over_total}, {"raw_grow_head_import", case_raw_grow_head_import},
         {"raw_grow_tail_import", case_raw_grow_tail_import}, {"raw_grow_cap", case_raw_grow_cap}, {"raw_grow_cap_counters", case_raw_grow_cap_counters},
         {"raw_diag_hull", case_raw_diag_hull}, {"raw_diag_dry", case_raw_diag_dry},
-        {"raw_diag_birth", case_raw_diag_birth},
+        {"raw_diag_birth", case_raw_diag_birth}, {"raw_share_page", case_raw_share_page},
         {"raw_ev_miss", case_raw_ev_miss}, {"raw_ev_survives_hits", case_raw_ev_survives_hits},
         {"raw_ev_lost", case_raw_ev_lost}, {"raw_ev_origin", case_raw_ev_origin},
         {"raw_dry_grow", case_raw_dry_grow}, {"raw_dry_stop", case_raw_dry_stop}, {"raw_dry_census", case_raw_dry_census}, {"raw_dry_g4", case_raw_dry_g4}, {"raw_dry_cap", case_raw_dry_cap},

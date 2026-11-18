@@ -181,7 +181,19 @@ static int g_filled;
 // The submission whose bind or begin is making backings now (0: none): fill_pool and rescan_cell take it for the birth
 // record of their imports, and cell_put for what an import takes over from the ones it replaces. g_lock exclusive.
 static uint64_t g_born_value;
-static int g_grow_cap_logged;   // a growth took the mirrors past BACKING_PROMOTE_MIRROR_MAX and said so (once a run)
+// The most bytes the mirrors may hold after a promotion (BACKING_PROMOTE_MIRROR_MAX), or OOT2_VK_MIRROR_CAP_MB megabytes when
+// that is set: the default was chosen for a card with a small VRAM, and the cap is what makes a bind that finds it reached
+// stay an import beside a mirror (a debugging and tuning aid; the tests run with the default).
+static uint64_t mirror_cap(void) {
+    static uint64_t cap;
+    if (!cap) {
+        const char *e = getenv("OOT2_VK_MIRROR_CAP_MB");
+        long long mb = e ? atoll(e) : 0;
+        cap = mb > 0 ? (uint64_t)mb << 20 : (uint64_t)BACKING_PROMOTE_MIRROR_MAX;
+    }
+    return cap;
+}
+static int g_grow_cap_logged;   // a growth took the mirrors past mirror_cap() and said so (once a run)
 static int g_union_on = 1;      // the union pass of backing_raw_begin runs (backing_set_union)
 static uint64_t g_adj_version;  // the map's version at the last union pass that left no chain alone for its value (g_lock exclusive)
 // The chains the pass left alone, by the place and the reason, so that a chain left at every begin is counted and written
@@ -237,9 +249,9 @@ static void changed(void) { __atomic_fetch_add(&g_version, 1, __ATOMIC_RELEASE);
 // reached and the most it stood above the cap. Not called by the dry evaluation of the dump. g_lock exclusive.
 static void mirror_note(void) {
     if (g_st.mirror_bytes > g_st.mirror_bytes_peak) g_st.mirror_bytes_peak = g_st.mirror_bytes;
-    if (g_st.mirror_bytes > BACKING_PROMOTE_MIRROR_MAX &&
-        g_st.mirror_bytes - BACKING_PROMOTE_MIRROR_MAX > g_st.mirror_overshoot_peak)
-        g_st.mirror_overshoot_peak = g_st.mirror_bytes - BACKING_PROMOTE_MIRROR_MAX;
+    if (g_st.mirror_bytes > mirror_cap() &&
+        g_st.mirror_bytes - mirror_cap() > g_st.mirror_overshoot_peak)
+        g_st.mirror_overshoot_peak = g_st.mirror_bytes - mirror_cap();
 }
 
 static void *grow(void *p, int *cap, int need, size_t size, const char *what) {
@@ -850,7 +862,10 @@ static void cell_put(Cell *c, uint64_t rs, uint64_t re, Backing *b) {
 
 // ---------- mirrors: copies in (g_coh)
 typedef struct Runs { Span *r; int n, cap; } Runs;
-typedef struct Ups { const Backing *m; BackingCopy *c; int n, cap; uint64_t bytes; } Ups;
+typedef struct WbImport WbImport;
+static WbImport *wbi_get(uint64_t lo, uint64_t size, uint64_t value);
+static const BackingMem *wbi_mem(const WbImport *w, uint64_t lo, uint64_t *off);
+typedef struct Ups { const Backing *m; BackingCopy *c; int n, cap; uint64_t bytes, value; int deferred; } Ups;
 
 static void runs_push(void *ctx, uint64_t lo, uint64_t hi) {
     Runs *s = ctx;
@@ -860,7 +875,12 @@ static void runs_push(void *ctx, uint64_t lo, uint64_t hi) {
 
 static void up_push(Ups *u, uint64_t lo, uint64_t hi) {
     u->c = grow(u->c, &u->cap, u->n + 1, sizeof *u->c, "a mirror's copies");
-    u->c[u->n++] = (BackingCopy){&u->m->mem, u->m->offset + (lo - u->m->gpu_lo), hi - lo, (const void *)(uintptr_t)lo};
+    BackingCopy *c = &u->c[u->n++];
+    *c = (BackingCopy){&u->m->mem, u->m->offset + (lo - u->m->gpu_lo), hi - lo, (const void *)(uintptr_t)lo, NULL, 0, NULL, 0};
+    if (u->deferred) {   // read at the copy's turn on the timeline, not now: the guest's pages over an import
+        WbImport *w = wbi_get(lo, hi - lo, u->value);
+        if (w) c->src = wbi_mem(w, lo, &c->src_offset), c->host = NULL;
+    }
     u->bytes += hi - lo;
 }
 
@@ -884,7 +904,8 @@ static void up_range(Ups *u, uint64_t lo, uint64_t hi, int i) {
 
 // Bring m current for submission value: query its range, then copy in what the CPU wrote since it was current last
 // (everything the first time), after the query, so the copy holds every write the query stamped.
-static void mirror_bring(Backing *m, uint64_t value) {
+static void no_run(void *ctx, uint64_t lo, uint64_t hi) { (void)ctx, (void)lo, (void)hi; }
+static void mirror_bring(Backing *m, uint64_t value, int deferred) {
     uint64_t g = pagegen_scan(m->gpu_lo, m->gpu_hi);
     if (g == UINT64_MAX)
         rt_fatal("gfx: vulkan: backing map: the write watch no longer covers the mirror of [%#llx, %#llx)",
@@ -897,7 +918,7 @@ static void mirror_bring(Backing *m, uint64_t value) {
     if (m->fresh) runs_push(&runs, m->gpu_lo, m->gpu_hi);
     else pagegen_runs_cpu(m->gpu_lo, m->gpu_hi, m->synced, runs_push, &runs);
     m->synced = g, m->fresh = 0;
-    Ups u = {.m = m};
+    Ups u = {.m = m, .value = value, .deferred = deferred};
     for (int i = 0; i < runs.n; i++) up_range(&u, runs.r[i].lo, runs.r[i].hi, 0);
     if (u.n) g_ops.upload(value, u.c, u.n);
     g_cst.mirror_syncs++, g_cst.uploads += (uint64_t)u.n, g_cst.upload_bytes += u.bytes;
@@ -905,21 +926,19 @@ static void mirror_bring(Backing *m, uint64_t value) {
     free(runs.r);
 }
 
-static void no_run(void *ctx, uint64_t lo, uint64_t hi) { (void)ctx, (void)lo, (void)hi; }
 
 // Raw stores into a mirror reach guest memory only when their submission's value is done (the raw path's write-back,
 // backing.h), so a copy into m taken while a raw-access submission is in flight would put the CPU's older bytes over
 // them in the mirror, and the write-back would then put the GPU's page over the CPU's newer bytes in guest memory. When
-// the CPU wrote m since it was current, wait for that submission first. g_coh held, dropped while waiting.
-static void raw_stores_wait(Backing *m, uint64_t value) {
+// the CPU wrote m since it was current that holds: 1 here. With the ops' direct_readback the copy is then made by the
+// device itself, reading the guest's pages over an import when its turn comes on the timeline, after that submission's
+// write-back (mirror_bring, deferred), and the thread waits for nothing; else it waits for that submission first.
+static int raw_stores_hazard(Backing *m, uint64_t value) {
     uint64_t r = raw_before(value);   // not value's own: a raw-access submission waits for the ones before it
-    if (m->fresh || !r || r >= value || r <= gpu_sync_done() || r > gpu_sync_issued()) return;
-    if (pagegen_scan(m->gpu_lo, m->gpu_hi) == UINT64_MAX) return;   // mirror_bring stops by name
-    if (!pagegen_runs_cpu(m->gpu_lo, m->gpu_hi, m->synced, no_run, NULL)) return;   // a GPU-current page is not copied
-    g_cst.raw_waits++;
-    plat_mutex_unlock(&g_coh);
-    wait_value(r);
-    plat_mutex_lock(&g_coh);
+    if (m->fresh || !r || r >= value || r <= gpu_sync_done() || r > gpu_sync_issued()) return 0;
+    if (pagegen_scan(m->gpu_lo, m->gpu_hi) == UINT64_MAX) return 0;   // mirror_bring stops by name
+    if (!pagegen_runs_cpu(m->gpu_lo, m->gpu_hi, m->synced, no_run, NULL)) return 0;   // a GPU-current page is not copied
+    return 1;
 }
 
 // The first resolve of mirror m in submission value brings it current; the later ones of that submission find it so.
@@ -927,9 +946,21 @@ static void raw_stores_wait(Backing *m, uint64_t value) {
 static void mirror_use(Backing *m, uint64_t value) {
     if (!value || __atomic_load_n(&m->sync_value, __ATOMIC_ACQUIRE) == value) return;
     plat_mutex_lock(&g_coh);
-    if (m->sync_value != value) raw_stores_wait(m, value);
+    int deferred = 0;
+    if (m->sync_value != value && raw_stores_hazard(m, value)) {
+        if (g_ops.direct_readback) {
+            deferred = 1;
+            g_cst.raw_deferred++;
+        } else {
+            uint64_t r = raw_before(value);
+            g_cst.raw_waits++;
+            plat_mutex_unlock(&g_coh);
+            wait_value(r);
+            plat_mutex_lock(&g_coh);
+        }
+    }
     if (m->sync_value != value) {
-        mirror_bring(m, value);
+        mirror_bring(m, value, deferred);
         __atomic_store_n(&m->sync_value, value, __ATOMIC_RELEASE);
     }
     plat_mutex_unlock(&g_coh);
@@ -1306,7 +1337,7 @@ static void cap_counts(char *out, size_t n) {
     snprintf(out, n, "mirror_bytes %llu (peak %llu, a promotion leaves at most %llu, peak overshoot %llu), growths that left it "
              "over the cap %llu; unions %llu (%llu mirrors, %llu imports, %llu bytes, mirrors moved by %lld bytes, %llu of the "
              "%llu bytes of the cap exemption used), chains left alone: written %llu, other cell %llu, past the cell %llu",
-             (ull)g_st.mirror_bytes, (ull)g_st.mirror_bytes_peak, (ull)BACKING_PROMOTE_MIRROR_MAX,
+             (ull)g_st.mirror_bytes, (ull)g_st.mirror_bytes_peak, (ull)mirror_cap(),
              (ull)g_st.mirror_overshoot_peak, (ull)g_st.raw_grow_over_cap, (ull)g_st.raw_union_chains,
              (ull)g_st.raw_union_mirror, (ull)g_st.raw_union_import, (ull)g_st.raw_union_bytes,
              (long long)g_st.raw_union_net_bytes, (ull)g_st.raw_union_overcap_bytes, (ull)BACKING_UNION_OVERSHOOT_MAX,
@@ -1495,7 +1526,7 @@ static void dry_growth(const Rec *rec, const Cell *c, const Backing *m, uint64_t
     }
     plat_mutex_unlock(&g_coh);
     if (!pagegen_covered(lo, hi)) mask |= 1u << DRY_G8;   // the real G8 asks the same of the whole grown range, with a reset
-    if (g_st.mirror_bytes + added > BACKING_PROMOTE_MIRROR_MAX) mask |= 1u << DRY_CAP;
+    if (g_st.mirror_bytes + added > mirror_cap()) mask |= 1u << DRY_CAP;
     ev_imp_of(&e->mir, m);
     e->kind = kind, e->mask = mask;
     e->x[0] = old_lo, e->x[1] = old_hi, e->x[2] = lo, e->x[3] = hi, e->x[4] = added, e->x[5] = g_st.mirror_bytes;
@@ -1566,7 +1597,7 @@ static void ev_line(const EvEnt *e) {
     case EV_PROMOTE:
         snprintf(d, sizeof d, "import [%#llx, %#llx) %s; mirror_bytes %llu, a promotion leaves at most %llu", (ull)x[0],
                  (ull)x[1], x[2] == 0 ? "made a mirror" : x[2] == 1 ? "not made: over the cap" : "not made: refused",
-                 (ull)x[3], (ull)BACKING_PROMOTE_MIRROR_MAX);
+                 (ull)x[3], (ull)mirror_cap());
         break;
     case EV_FILL:
         snprintf(d, sizeof d, "import [%#llx, %#llx) made for the page table's invariant", (ull)x[0], (ull)x[1]);
@@ -1612,7 +1643,7 @@ static void ev_line(const EvEnt *e) {
                  "its offset %#llx); rule says %s; mirror_bytes %llu, at most %llu; block room before its part [%#llx, "
                  "%#llx) %#llx after %#llx; %llu other mirrors of the cell on the bind; the evaluation left the map %s (its digest leaves out the list of GPU writes); refuses: %s",
                  (ull)x[0], (ull)x[1], (ull)x[2], (ull)x[3], (ull)x[4], (ull)x[6], (ull)x[7], kind_name(e->kind),
-                 (ull)x[5], (ull)BACKING_PROMOTE_MIRROR_MAX, (ull)x[10], (ull)x[11], (ull)x[8], (ull)x[9], (ull)x[12],
+                 (ull)x[5], (ull)mirror_cap(), (ull)x[10], (ull)x[11], (ull)x[8], (ull)x[9], (ull)x[12],
                  x[13] ? "CHANGED" : "unchanged", e->mask ? list : "nothing (it would grow)");
     }
     }
@@ -1704,6 +1735,14 @@ static void diag_stop(const Cell *c, const Backing *m, uint64_t plo, uint64_t ph
     rt_log(DIAG "stop %llu of this run follows", (ull)g_st.raw_straddle_stops);
 }
 
+// Why the last growth (grow_taken) was refused, for make(): GROW_NO_OTHER for a reason that is about the bytes (an import the
+// submission wrote or reached in an unstated way, a copy of another cell, a declared GPU write), which stops the bind;
+// GROW_NO_MIRROR for a reason of room (another mirror on the pages, no space in the block, the growth too large or past the
+// buffer) and GROW_NO_UP (an import of the submission lies above what it reached): in these the growth could not be made and
+// nothing the submission recorded is at stake beyond the bind's own pages (beside).
+enum { GROW_NO_OTHER, GROW_NO_MIRROR, GROW_NO_UP };
+static int g_grow_refusal;
+
 // A bind takes pages of mirror m that the submission being recorded (value) already resolved, so m cannot give them to
 // an import: what was recorded before reaches m's copy, and what follows would reach the import's. m grows over them in
 // place instead, to the hull of its pages and the bind's only, at the same device addresses, so that every bind and every
@@ -1721,6 +1760,7 @@ static void diag_stop(const Cell *c, const Backing *m, uint64_t plo, uint64_t ph
 // caller stops by name. g_lock exclusive.
 #define GROW_WHY 256
 static int grow_taken(Rec *r, Cell *c, Backing *m, uint64_t plo, uint64_t phi, uint64_t value, char *why) {
+    g_grow_refusal = GROW_NO_MIRROR;   // until a refusal of the data says otherwise
     uint64_t old_lo = m->gpu_lo, old_hi = m->gpu_hi;
     uint64_t lo = plo < old_lo ? plo : old_lo, hi = phi > old_hi ? phi : old_hi;
     uint64_t added = old_lo - lo + hi - old_hi;
@@ -1735,6 +1775,7 @@ static int grow_taken(Rec *r, Cell *c, Backing *m, uint64_t plo, uint64_t phi, u
         if (b->kind != BACKING_IMPORT) {
             snprintf(why, GROW_WHY, "another mirror, [%#llx, %#llx), lies on the pages it would add", (ull)b->gpu_lo,
                      (ull)b->gpu_hi);
+            g_grow_refusal = GROW_NO_MIRROR;
             return 0;
         }
         int gi = import_gives(b, b->gpu_lo > lo ? b->gpu_lo : lo, b->gpu_hi < hi ? b->gpu_hi : hi, value);
@@ -1742,6 +1783,7 @@ static int grow_taken(Rec *r, Cell *c, Backing *m, uint64_t plo, uint64_t phi, u
             snprintf(why, GROW_WHY, "the import [%#llx, %#llx), which this submission bound, lies on the pages it "
                      "would add%s%s", (ull)b->gpu_lo, (ull)b->gpu_hi, *k_gi_why[gi] ? ": it " : "", k_gi_why[gi]);
             g_st.raw_refused[gi]++;
+            g_grow_refusal = gi == GI_UP ? GROW_NO_UP : GROW_NO_OTHER;
             return 0;
         }
         // A used import is trimmed at its start (below), so it must start on the tail the mirror grows over and run past it;
@@ -1749,6 +1791,7 @@ static int grow_taken(Rec *r, Cell *c, Backing *m, uint64_t plo, uint64_t phi, u
         if (used_by(b) >= value && (b->gpu_lo < old_hi || b->gpu_hi <= hi)) {
             snprintf(why, GROW_WHY, "the import [%#llx, %#llx) this submission bound would be cut at its start by the "
                      "growth", (ull)b->gpu_lo, (ull)b->gpu_hi);
+            g_grow_refusal = GROW_NO_OTHER;
             return 0;
         }
     }
@@ -1764,6 +1807,7 @@ static int grow_taken(Rec *r, Cell *c, Backing *m, uint64_t plo, uint64_t phi, u
                 if (!overlaps(lo, hi, b->gpu_lo, b->gpu_hi)) continue;
                 snprintf(why, GROW_WHY, "a backing of another cell, [%#llx, %#llx), lies on the pages it would add",
                          (ull)b->gpu_lo, (ull)b->gpu_hi);
+                g_grow_refusal = GROW_NO_OTHER;
                 return 0;
             }
         }
@@ -1826,7 +1870,8 @@ static int grow_taken(Rec *r, Cell *c, Backing *m, uint64_t plo, uint64_t phi, u
             plat_mutex_unlock(&g_coh);
             snprintf(why, GROW_WHY, "this submission declared a GPU write over [%#llx, %#llx) of the pages it would "
                      "add", (ull)p->lo, (ull)p->hi);
-            return 0;
+            g_grow_refusal = GROW_NO_OTHER;
+        return 0;
         }
         if (p->value > wait) wait = p->value;
     }
@@ -1880,7 +1925,7 @@ static int grow_taken(Rec *r, Cell *c, Backing *m, uint64_t plo, uint64_t phi, u
     g_st.mirror_bytes += added;
     g_st.raw_grows++, g_st.raw_grow_bytes += added;
     g_st.raw_grow_used += (uint64_t)(trims > 0);
-    g_st.raw_grow_over_cap += (uint64_t)(g_st.mirror_bytes > BACKING_PROMOTE_MIRROR_MAX);
+    g_st.raw_grow_over_cap += (uint64_t)(g_st.mirror_bytes > mirror_cap());
     mirror_note();
     changed();
     if (g_st.raw_grows <= 64)
@@ -1888,17 +1933,17 @@ static int grow_taken(Rec *r, Cell *c, Backing *m, uint64_t plo, uint64_t phi, u
                "%#llx), adding %#llx bytes; %d used imports trimmed, %d unused deferred%s; mirror_bytes %llu%s",
                (ull)g_st.raw_grows, (ull)value, (ull)old_lo, (ull)old_hi, (ull)lo, (ull)hi, (ull)added, trims, replaced,
                waited ? ", waited for the submissions issued" : "", (ull)g_st.mirror_bytes, did);
-    if (g_st.mirror_bytes > BACKING_PROMOTE_MIRROR_MAX && !g_grow_cap_logged) {
+    if (g_st.mirror_bytes > mirror_cap() && !g_grow_cap_logged) {
         g_grow_cap_logged = 1;
         rt_log("gfx: vulkan: backing map: a growth of a mirror left the mirrors at %llu bytes, past the %llu a promotion "
                "leaves; the growth is exempt (it adds at most %llu bytes); growths over the cap so far %llu, mirror_bytes "
-               "peak %llu, peak overshoot %llu", (ull)g_st.mirror_bytes, (ull)BACKING_PROMOTE_MIRROR_MAX,
+               "peak %llu, peak overshoot %llu", (ull)g_st.mirror_bytes, (ull)mirror_cap(),
                (ull)BACKING_MIRROR_GROW_MAX, (ull)g_st.raw_grow_over_cap, (ull)g_st.mirror_bytes_peak,
                (ull)g_st.mirror_overshoot_peak);
     }
 
     plat_mutex_lock(&g_coh);
-    Ups u = {.m = m};
+    Ups u = {.m = m, .value = value};
     if (lo < old_lo) up_range(&u, lo, old_lo, 0);
     if (old_hi < hi) up_range(&u, old_hi, hi, 0);
     if (u.n) g_ops.upload(value, u.c, u.n);
@@ -1906,6 +1951,15 @@ static int grow_taken(Rec *r, Cell *c, Backing *m, uint64_t plo, uint64_t phi, u
     free(u.c);
     plat_mutex_unlock(&g_coh);
     return 1;
+}
+
+// After a mirror gave pages up (beside), what the submission resolved in it lies inside what is left: a hull part in the
+// pages that went is the part the earlier binds read through the mirror's own memory, which stays until they are done.
+static void clamp_hull(Backing *m) {
+    if (!m->res_n) return;
+    if (m->res_lo < m->gpu_lo) m->res_lo = m->gpu_lo;
+    if (m->res_hi > m->gpu_hi) m->res_hi = m->gpu_hi;
+    if (m->res_lo >= m->res_hi) m->res_n = 0, m->res_lo = UINT64_MAX, m->res_hi = 0, m->res_loose = 0;
 }
 
 // The page table of a raw-access submission is read after the submission is recorded, and is rewritten as the map moves
@@ -1922,7 +1976,8 @@ static int grow_taken(Rec *r, Cell *c, Backing *m, uint64_t plo, uint64_t phi, u
 // grow's reason (why, set by grow_taken).
 // *rs and *re, the committed run around the pages [plo, phi) of the bind, are narrowed to what the new backing covers.
 // g_lock exclusive.
-static void beside(Cell *c, uint64_t plo, uint64_t phi, uint64_t *rs, uint64_t *re, uint64_t value, const char *why) {
+static void beside(Cell *c, uint64_t plo, uint64_t phi, uint64_t blo, uint64_t bhi, int relax, uint64_t *rs, uint64_t *re,
+                   uint64_t value, const char *why) {
     int gave = 0;
     for (int i = 0; i < c->nimp; i++) {
         Backing *m = c->imp[i];
@@ -1936,7 +1991,16 @@ static void beside(Cell *c, uint64_t plo, uint64_t phi, uint64_t *rs, uint64_t *
             continue;
         }
         uint64_t cl = m->gpu_lo > plo ? m->gpu_lo : plo, ch = m->gpu_hi < phi ? m->gpu_hi : phi;   // what the bind takes
-        if (m->res_value == value && m->res_lo < ch && cl < m->res_hi) {
+        // Where the growth was refused only because another mirror or an import above its reach lies on the pages (relax),
+        // what the submission resolved in the mirror (its hull) and what the bind takes are compared by their bytes, not by
+        // the pages the bind's backing covers: two binds side by side in memory often share the page between them (a
+        // buffer ends in the page the next one starts in), and then the bind's import takes that page from the mirror
+        // while the bytes the mirror served lie wholly outside the bind's own. Nothing recorded before reaches a byte the
+        // import reaches, so the page may change hands, as long as the submission wrote nothing into the mirror on the
+        // GPU (a write-back of the mirror's page would then reach the import's bytes).
+        const int shared_page_only = relax && !m->res_loose && !overlaps(blo, bhi, m->res_lo, m->res_hi) &&
+                                     __atomic_load_n(&m->written, __ATOMIC_ACQUIRE) != value;
+        if (m->res_value == value && m->res_lo < ch && cl < m->res_hi && !shared_page_only) {
             diag_stop(c, m, plo, phi, *rs, *re, value, why);
             rt_fatal("gfx: vulkan: backing map: the mirror [%#llx, %#llx) was bound over [%#llx, %#llx) earlier in "
                      "raw-access submission %llu, and a bind over [%#llx, %#llx) now takes pages of it for an import: "
@@ -1953,6 +2017,7 @@ static void beside(Cell *c, uint64_t plo, uint64_t phi, uint64_t *rs, uint64_t *
             born(m, BORN_BESIDE_FRONT, value, m->gpu_lo, m->gpu_hi);
             g_st.mirror_bytes -= m->gpu_hi - plo;
             m->gpu_hi = plo;
+            clamp_hull(m);
             if (*rs < plo) *rs = plo;
             ev->x[2] = m->gpu_lo, ev->x[3] = m->gpu_hi;
         } else if (m->gpu_hi > phi) {   // it keeps its end
@@ -1961,6 +2026,7 @@ static void beside(Cell *c, uint64_t plo, uint64_t phi, uint64_t *rs, uint64_t *
             g_st.mirror_bytes -= phi - m->gpu_lo;
             m->offset += phi - m->gpu_lo;
             m->gpu_lo = phi;
+            clamp_hull(m);
             if (*re > phi) *re = phi;
             ev->x[2] = m->gpu_lo, ev->x[3] = m->gpu_hi;
         } else {   // the bind covers it all: it goes now, and is freed once the raw-access submission is done
@@ -2118,7 +2184,7 @@ static void make(uint64_t addr, uint64_t size, uint64_t value) {
     if (value && raw_last() == value) {
         g_bind.r = r, g_bind.addr = addr, g_bind.size = size, g_bind.kind = kind;
         char why[GROW_WHY] = "no growth was tried";
-        int refused = 0;
+        int refused = 0, refusal = GROW_NO_OTHER;   // refusal: why the growth was refused (grow_taken)
         for (int i = 0; i < c->nimp; i++) {
             Backing *m = c->imp[i];
             if (m->kind != BACKING_MIRROR || m->res_value != value ||
@@ -2139,7 +2205,7 @@ static void make(uint64_t addr, uint64_t size, uint64_t value) {
                 return;
             }
             diag_refusal(m, plo, phi, value, why);
-            refused = 1;
+            refused = 1, refusal = g_grow_refusal;
             break;
         }
         // The candidate fix, evaluated and not acted on: a mirror the bind cuts that the submission did not resolve there.
@@ -2155,7 +2221,7 @@ static void make(uint64_t addr, uint64_t size, uint64_t value) {
         }
         if (dm) dry_growth(r, c, dm, plo, phi, value, kind, others);
         if (kind == BACKING_MIRROR) kind = BACKING_IMPORT;
-        beside(c, plo, phi, &rs, &re, value, why);
+        beside(c, plo, phi, addr, addr + size, refused && refusal != GROW_NO_OTHER, &rs, &re, value, why);
     }
     replace_wait(c, rs, re, value, kind == BACKING_MIRROR);
     Backing *b = kind == BACKING_MIRROR ? mirror_admit(r, rs, re, BACKING_MIRROR_GUARD) : NULL;
@@ -2245,11 +2311,69 @@ uint64_t backing_synced_min(void) {
 typedef struct WbItem { uint64_t lo, size; const void *host; } WbItem;
 typedef struct Wb { int n; WbItem item[]; } Wb;
 
+// The copy of a write-back is memory bandwidth, and a thread alone gets a fraction of the machine's (about 4 GB/s here, with
+// 20 MiB of GPU writes to bring back at the end of every submission, which the guest waits for): a few helper threads and
+// the completion thread take the 1 MiB pieces of it in turn.
+typedef struct WbChunk { void *dst; const void *src; size_t n; } WbChunk;
+#define WB_PIECE (1u << 20)
+#define WB_PARALLEL_MIN (2u << 20)   // below this the helpers are not woken
+static struct {
+    PlatMutex mu;
+    PlatCond work, done;
+    WbChunk *chunk;
+    int nchunk, next, pending, workers, started;
+} g_wbp = {.mu = PLAT_MUTEX_INIT, .work = PLAT_COND_INIT, .done = PLAT_COND_INIT};
+
+// Take pieces until none is left to take (g_wbp.mu held on entry and on return).
+static void wb_take_pieces(void) {
+    while (g_wbp.next < g_wbp.nchunk) {
+        WbChunk c = g_wbp.chunk[g_wbp.next++];
+        plat_mutex_unlock(&g_wbp.mu);
+        memcpy(c.dst, c.src, c.n);
+        plat_mutex_lock(&g_wbp.mu);
+        if (--g_wbp.pending == 0) plat_cond_broadcast(&g_wbp.done);
+    }
+}
+
+static void wb_worker(void *arg) {
+    (void)arg;
+    plat_mutex_lock(&g_wbp.mu);
+    for (;;) {
+        while (g_wbp.next >= g_wbp.nchunk) plat_cond_wait(&g_wbp.work, &g_wbp.mu);
+        wb_take_pieces();
+    }
+}
+
+static void wb_copy(WbChunk *c, int n, uint64_t total) {
+    if (total < WB_PARALLEL_MIN) {
+        for (int i = 0; i < n; i++) memcpy(c[i].dst, c[i].src, c[i].n);
+        return;
+    }
+    plat_mutex_lock(&g_wbp.mu);
+    if (!g_wbp.started) {
+        g_wbp.started = 1;
+        int cpus = plat_cpu_count();
+        g_wbp.workers = cpus >= 8 ? 3 : cpus >= 4 ? 2 : 0;
+        for (int i = 0; i < g_wbp.workers; i++)
+            if (!plat_thread_start(wb_worker, NULL, 1u << 20)) g_wbp.workers = i;
+    }
+    g_wbp.chunk = c, g_wbp.nchunk = n, g_wbp.next = 0, g_wbp.pending = n;
+    if (g_wbp.workers) plat_cond_broadcast(&g_wbp.work);
+    wb_take_pieces();
+    while (g_wbp.pending) plat_cond_wait(&g_wbp.done, &g_wbp.mu);
+    g_wbp.nchunk = g_wbp.next = 0;   // the helpers go back to sleep; c is the caller's again
+    plat_mutex_unlock(&g_wbp.mu);
+}
+
 // The completion thread, once the device reached value and before value is done: the bytes go into guest memory (a
 // page the guest no longer maps is left out and counted), are stamped as written, and leave the pending list.
 static void writeback(void *arg, uint64_t value) {
     Wb *w = arg;
     plat_mutex_lock(&g_coh);
+    uint8_t *taken = calloc((size_t)w->n + 1, 1);
+    uint64_t total = 0;
+    int pieces = 0;
+    if (!taken) rt_fatal("gfx: vulkan: backing map: out of memory for a write-back");
     for (int i = 0; i < w->n; i++) {
         const WbItem *it = &w->item[i];
         if (!rt_mem_commit_io(it->lo, it->size, 1)) {
@@ -2258,18 +2382,115 @@ static void writeback(void *arg, uint64_t value) {
                        "guest no longer maps: left out", (ull)it->lo, (ull)(it->lo + it->size), (ull)value);
             continue;
         }
-        memcpy((void *)(uintptr_t)it->lo, it->host, it->size);
+        taken[i] = 1;
+        if (!it->host) continue;   // the device wrote these bytes into place
+        total += it->size;
+        pieces += (int)((it->size + WB_PIECE - 1) / WB_PIECE);
+    }
+    WbChunk *chunks = malloc(sizeof *chunks * ((size_t)pieces + 1));
+    if (!chunks) rt_fatal("gfx: vulkan: backing map: out of memory for a write-back");
+    int nc = 0;
+    for (int i = 0; i < w->n; i++) {
+        if (!taken[i] || !w->item[i].host) continue;
+        const WbItem *it = &w->item[i];
+        for (uint64_t off = 0; off < it->size; off += WB_PIECE) {
+            uint64_t n = it->size - off < WB_PIECE ? it->size - off : WB_PIECE;
+            chunks[nc++] = (WbChunk){(void *)(uintptr_t)(it->lo + off), (const uint8_t *)it->host + off, (size_t)n};
+        }
+    }
+    wb_copy(chunks, nc, total);
+    free(chunks);
+    for (int i = 0; i < w->n; i++) {
+        if (!taken[i]) continue;
+        const WbItem *it = &w->item[i];
         // The mirror holds these bytes already: the pages the write covers whole are recorded as GPU-current, so the
         // next sync does not hand them back (they are most of a large write); the rest are marked for a copy.
         pagegen_mark_gpu(it->lo, it->lo + it->size);
         g_cst.writebacks++, g_cst.writeback_bytes += it->size;
     }
+    free(taken);
     int k = 0;
     for (int i = 0; i < g_npend; i++)
         if (g_pend[i].value != value) g_pend[k++] = g_pend[i];
     g_npend = k;
     plat_mutex_unlock(&g_coh);
     free(w);
+}
+
+// ---------- the write-back destinations
+// With the ops' direct_readback the device writes a mirror's GPU writes into guest memory itself, over an import of the
+// pages (no copy by the completion thread, which was the end of every submission's critical path: 20 MiB of it). The imports
+// are kept for the next submission, which writes the same render targets again; one outlives neither the commit epoch
+// (a page recommitted is another page) nor its last submission.
+typedef struct WbImport {
+    uint64_t lo, hi, last;
+    uint64_t depoch;   // the decommit epoch before the import was made
+    BackingMem mem;
+    int dead;
+} WbImport;
+enum { WBI_MAX = 96 };
+static WbImport *g_wbi[WBI_MAX];
+static int g_nwbi;
+static uint64_t g_wbi_epoch;
+
+static void wbi_reap(uint64_t done, int all) {
+    int k = 0;
+    for (int i = 0; i < g_nwbi; i++) {
+        WbImport *e = g_wbi[i];
+        if (e->last <= done && (e->dead || all)) {
+            g_ops.free(&e->mem);
+            free(e);
+        } else {
+            g_wbi[k++] = e;
+        }
+    }
+    g_nwbi = k;
+}
+
+// The import over [lo, lo + size) (g_coh held), or NULL: the staging path then.
+static WbImport *wbi_get(uint64_t lo, uint64_t size, uint64_t value) {
+    if (!g_ops.direct_readback) return NULL;
+    uint64_t plo = lo & ~0xfffull, phi = (lo + size + 0xfff) & ~0xfffull;
+    int ready = rt_mem_ready();
+    uint64_t de = ready ? rt_mem_decommit_epoch() : 0, done = gpu_sync_done();
+    // An import holds the pages it was made over: it goes when the guest decommitted one of them since (a page committed
+    // again is another page), and only then; a decommit or a commit elsewhere leaves it be (the whole cache went at every
+    // one, and the imports made again cost a few milliseconds of a frame every few frames).
+    if (ready && de != g_wbi_epoch) {
+        g_wbi_epoch = de;
+        for (int i = 0; i < g_nwbi; i++)
+            if (!g_wbi[i]->dead && rt_mem_decommitted(g_wbi[i]->depoch, g_wbi[i]->lo, g_wbi[i]->hi)) g_wbi[i]->dead = 1;
+    }
+    wbi_reap(done, 0);
+    for (int i = 0; i < g_nwbi; i++)
+        if (!g_wbi[i]->dead && g_wbi[i]->lo <= plo && g_wbi[i]->hi >= phi) {
+            g_wbi[i]->last = value;
+            return g_wbi[i];
+        }
+    if (g_nwbi >= WBI_MAX) {   // the oldest one that is done goes
+        int old = -1;
+        for (int i = 0; i < g_nwbi; i++)
+            if (g_wbi[i]->last <= done && (old < 0 || g_wbi[i]->last < g_wbi[old]->last)) old = i;
+        if (old < 0) return NULL;
+        g_wbi[old]->dead = 1;
+        wbi_reap(done, 0);
+    }
+    uint64_t depoch = ready ? rt_mem_decommit_epoch() : 0;
+    if (!rt_mem_commit_io(plo, phi - plo, 1)) return NULL;
+    WbImport *n = calloc(1, sizeof *n);
+    if (!n) return NULL;
+    if (!g_ops.import(plo, phi - plo, &n->mem)) {
+        free(n);
+        return NULL;
+    }
+    n->lo = plo, n->hi = phi, n->last = value, n->depoch = depoch;
+    g_wbi[g_nwbi++] = n;
+    return n;
+}
+
+static const BackingMem *wbi_mem(const WbImport *w, uint64_t lo, uint64_t *off) {
+    *off = lo - w->lo;
+    return &w->mem;
 }
 
 void backing_submit_end(uint64_t value) {
@@ -2288,7 +2509,9 @@ void backing_submit_end(uint64_t value) {
     for (int i = 0; i < g_npend; i++) {
         const Pending *p = &g_pend[i];
         if (p->value != value) continue;
-        c[w->n] = (BackingCopy){&p->m->mem, p->m->offset + (p->lo - p->m->gpu_lo), p->hi - p->lo, NULL};
+        c[w->n] = (BackingCopy){&p->m->mem, p->m->offset + (p->lo - p->m->gpu_lo), p->hi - p->lo, NULL, NULL, 0, NULL, 0};
+        WbImport *d = wbi_get(p->lo, p->hi - p->lo, value);
+        if (d) c[w->n].dst = &d->mem, c[w->n].dst_offset = p->lo - d->lo;
         w->item[w->n++] = (WbItem){p->lo, p->hi - p->lo, NULL};
     }
     g_ops.readback(value, c, n);
@@ -2300,6 +2523,10 @@ void backing_submit_end(uint64_t value) {
 
 void backing_guest_written(uint64_t addr, uint64_t size) {
     if (!size || addr >= RT_ADDRESS_LIMIT) return;   // the GPU window: no CPU wrote it
+    // Where the operating system's write watch is the source, a flush adds nothing: the page's own write mark says whether
+    // the CPU wrote it, which the next query stamps. The game flushes whole buffers (15 MiB of a pool a frame) it wrote a
+    // little of, and the plain stamp would have every mirror over them copied in whole at the next sync.
+    if (pagegen_watch_is_precise()) return;
     pagegen_mark(addr, addr + size);
 }
 
@@ -2524,7 +2751,7 @@ static int union_kind(const Rec *r, const Cell *c, int i, int j, uint64_t *over)
     *over = 0;
     BackingAsk ask = {lo, hi - lo, r->flags};
     if (!has_mirrors() || !g_mirror_hook || backing_rule(&ask) != BACKING_MIRROR) return UK_IMPORT_RULE;
-    if (g_st.mirror_bytes - mine + up(hi - lo, BACKING_EXTENT_ALIGN) <= BACKING_PROMOTE_MIRROR_MAX) return UK_MIRROR;
+    if (g_st.mirror_bytes - mine + up(hi - lo, BACKING_EXTENT_ALIGN) <= mirror_cap()) return UK_MIRROR;
     uint64_t net = (hi - lo) - mine;
     if (net > BACKING_MIRROR_GROW_MAX || g_st.raw_union_overcap_bytes + net > BACKING_UNION_OVERSHOOT_MAX)
         return UK_IMPORT_CAP;
@@ -2633,7 +2860,7 @@ static void promote_capped(Rec *r, Backing *b, uint64_t lo, uint64_t hi, uint64_
         r->mirror_logged = 1;
         rt_log("gfx: vulkan: backing map: the mirror of [%#llx, %#llx) (%llu KiB) in pool [%#llx, %#llx) is not made: "
                "the mirrors would pass %llu MiB, the most a promotion makes; imported", (ull)lo, (ull)hi,
-               (ull)((hi - lo) >> 10), (ull)r->lo, (ull)r->hi, (ull)(BACKING_PROMOTE_MIRROR_MAX >> 20));
+               (ull)((hi - lo) >> 10), (ull)r->lo, (ull)r->hi, (ull)(mirror_cap() >> 20));
     }
 }
 
@@ -2697,7 +2924,7 @@ static void promote_hot(uint64_t value) {
                         continue;
                     }
                 }
-                if (g_st.mirror_bytes + up(hi - lo, BACKING_EXTENT_ALIGN) > BACKING_PROMOTE_MIRROR_MAX) {
+                if (g_st.mirror_bytes + up(hi - lo, BACKING_EXTENT_ALIGN) > mirror_cap()) {
                     promote_capped(r, b, lo, hi, value);
                     continue;
                 }
@@ -2876,7 +3103,7 @@ void backing_stats(BackingStats *out) {
     out->mirror_syncs = g_cst.mirror_syncs, out->uploads = g_cst.uploads, out->upload_bytes = g_cst.upload_bytes;
     out->writebacks = g_cst.writebacks, out->writeback_bytes = g_cst.writeback_bytes;
     out->writebacks_skipped = g_cst.writebacks_skipped, out->reads_in_flight = g_cst.reads_in_flight;
-    out->pending = (uint64_t)g_npend, out->raw_waits = g_cst.raw_waits;
+    out->pending = (uint64_t)g_npend, out->raw_waits = g_cst.raw_waits, out->raw_deferred = g_cst.raw_deferred;
     plat_mutex_unlock(&g_coh);
     out->raw_dry_evals = g_dry.evals, out->raw_dry_would_grow = g_dry.would, out->raw_dry_refused = g_dry.refused, out->raw_dry_mutated = g_dry.mutated;
     memcpy(out->raw_dry_g, g_dry.g, sizeof out->raw_dry_g);
@@ -2988,6 +3215,7 @@ void backing_close(void) {
     plat_unlock(&g_lock);
     plat_mutex_lock(&g_coh);
     g_npend = 0;   // every submission is done (gpu_sync_finish came first): their write-backs ran
+    wbi_reap(UINT64_MAX, 1);
     plat_mutex_unlock(&g_coh);
     free_all(&f);
     if (g_ops.close) g_ops.close();

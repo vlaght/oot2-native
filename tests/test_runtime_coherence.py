@@ -54,7 +54,7 @@ PASSING = ("generations", "upload", "admission", "guarded_admission", "writeback
            "raw_dry_grow", "raw_dry_g4", "raw_dry_cap", "raw_dry_kind", "raw_dry_none", "raw_dry_g4_on", "raw_dry_g8",
            "raw_dry_g5", "raw_dry_g1", "raw_dry_g2",
            "raw_grow_used_import", "raw_grow_used_edge", "raw_grow_used_wait", "raw_grow_heir", "raw_grow_heir_old",
-           "raw_grow_used_decommit",
+           "raw_grow_used_decommit", "raw_share_page",
            "union_grow_mirror", "union_grow_import",
            "union_begin_straddle", "union_slide_grows", "union_cap_demote", "union_cap_exempt", "union_exact_bytes", "union_order",
            "union_promote_chain", "union_quiet", "union_other_cell", "union_left_hot", "union_hot_cap", "union_hot_rule",

@@ -181,6 +181,14 @@ typedef struct BackingCopy {
     const BackingMem *mem;
     uint64_t offset, size;
     const void *host;
+    // A readback only, with the ops' direct_readback: the import that takes the bytes in place (guest memory, where
+    // they belong), at dst_offset. Then host stays NULL, and nothing is left to copy when the value is done.
+    const BackingMem *dst;
+    uint64_t dst_offset;
+    // An upload only, with direct_readback: the import to read the bytes from at src_offset when the copy runs on the
+    // device's timeline (guest memory as it is then), not taken by the call. Then host is NULL.
+    const BackingMem *src;
+    uint64_t src_offset;
 } BackingCopy;
 typedef struct BackingOps {
     // A VRAM block of size bytes with one buffer over it: 1, or 0 when the device has no room (a named fatal follows).
@@ -201,6 +209,9 @@ typedef struct BackingOps {
     void (*readback)(uint64_t value, BackingCopy *c, int n);
     // backing_close, once every backing is freed: the memory uploads and readbacks used goes.
     void (*close)(void);
+    // 1 when readback honours BackingCopy.dst: the write-back of a mirror's GPU writes then goes into guest memory by the
+    // device itself, over an import, and the completion thread copies nothing.
+    int direct_readback;
 } BackingOps;
 
 // Open the map over ops (the Vulkan back end at gpu_vk_open, after its timeline started; a test with stand-ins), and
@@ -307,6 +318,7 @@ typedef struct BackingStats {
     uint64_t pending, reads_in_flight;                                 // GPU writes not written back yet; early reads
     uint64_t raw_begins, raw_passes;                                   // raw-access submissions; passes of the invariant
     uint64_t raw_fill_imports, raw_fill_bytes, raw_fill_extents;       // what those passes made
+    uint64_t raw_deferred;                                             // mirror copies made on the timeline instead of waiting
     uint64_t raw_waits;                                                // mirror copies that waited for raw stores
     uint64_t raw_promoted, raw_promote_bytes;                          // imports given a mirror at a raw-access begin
     uint64_t raw_straddle_stops;                                       // raw-access stops whose dump was printed (beside)

@@ -220,6 +220,11 @@ static void full_barrier(VkCommandBuffer cb, VkPipelineStageFlags2 dst_stage, Vk
 static void vk_upload(uint64_t value, const BackingCopy *c, int n) {
     VkCommandBuffer cb = gpu_vk_prologue();
     for (int i = 0; i < n; i++) {
+        if (c[i].src) {
+            VkBufferCopy r = {.srcOffset = c[i].src_offset, .dstOffset = c[i].offset, .size = c[i].size};
+            vkCmdCopyBuffer(cb, (VkBuffer)(uintptr_t)c[i].src->buffer, (VkBuffer)(uintptr_t)c[i].mem->buffer, 1, &r);
+            continue;
+        }
         uint64_t at;
         Stage *s = stage_take(value, c[i].size, &at);
         memcpy(s->map + at, c[i].host, c[i].size);
@@ -232,6 +237,12 @@ static void vk_readback(uint64_t value, BackingCopy *c, int n) {
     VkCommandBuffer cb = gpu_vk_epilogue();   // not the main command buffer: the recorder thread records that one
     full_barrier(cb, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
     for (int i = 0; i < n; i++) {
+        if (c[i].dst) {
+            VkBufferCopy r = {.srcOffset = c[i].offset, .dstOffset = c[i].dst_offset, .size = c[i].size};
+            vkCmdCopyBuffer(cb, (VkBuffer)(uintptr_t)c[i].mem->buffer, (VkBuffer)(uintptr_t)c[i].dst->buffer, 1, &r);
+            c[i].host = NULL;
+            continue;
+        }
         uint64_t at;
         Stage *s = stage_take(value, c[i].size, &at);
         VkBufferCopy r = {.srcOffset = c[i].offset, .dstOffset = at, .size = c[i].size};
@@ -255,12 +266,14 @@ static void vk_close(void) {
 
 const BackingOps gpu_vk_backing_ops = {.block_new = vk_block_new, .import = vk_import, .free = vk_free,
                                        .vram = vk_vram, .upload = vk_upload, .readback = vk_readback,
-                                       .close = vk_close};
+                                       .close = vk_close, .direct_readback = 1};
 
 // Mirrors on a discrete device, where imported host memory is read across the bus (D14; the raw-address study: 22.9 times
 // slower than VRAM); imports on any other, where VRAM is host memory too.
 static int want_mirror(const BackingAsk *ask) {
     (void)ask;
+    const char *off = getenv("OOT2_VK_MIRROR");   // "off": imports only, as on a platform without a write watch (a debugging aid)
+    if (off && !strcmp(off, "off")) return 0;
     return gpu_vk.facts.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
 }
 

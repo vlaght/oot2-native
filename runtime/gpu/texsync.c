@@ -59,7 +59,6 @@ int texsync_regions(const nvn_texdesc *d, uint64_t storage, TexSync *st, TexRegi
     nvn_tex_layout(d, &L);
     int linear = nvn_tex_is_linear(d);
     UntileGeom g;
-    if (!linear && !untile_geom(d, 0, 0, &g, why)) return -1;
     if (!L.size) {
         *why = "a texture of no storage";
         return -1;
@@ -68,6 +67,15 @@ int texsync_regions(const nvn_texdesc *d, uint64_t storage, TexSync *st, TexRegi
     uint64_t gen = pagegen_scan(lo, hi);
     int tracked = gen != UINT64_MAX;
     uint64_t since = st->defined && tracked ? st->gen : 0;
+    // The common answer, nothing written since the last look: no level or layer is walked for it.
+    if (tracked && st->defined && !newer(lo, hi, since)) {
+        plat_mutex_lock(&g_mu);
+        g_st.queries++, g_st.unchanged++;
+        plat_mutex_unlock(&g_mu);
+        st->gen = gen;
+        return 0;
+    }
+    if (!linear && !untile_geom(d, 0, 0, &g, why)) return -1;
     int n = 0, zeros = 0;
     unsigned levels = linear ? 1 : (d->levels ? d->levels : 1), layers = linear ? 1 : L.layers;
     for (unsigned layer = 0; layer < layers; layer++)

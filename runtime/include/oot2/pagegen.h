@@ -42,6 +42,9 @@ uint64_t pagegen_scan(uint64_t lo, uint64_t hi);
 int pagegen_covered(uint64_t lo, uint64_t hi);
 // Stamp every page of [lo, hi) with a new generation without a query, and return it: the CPU said it wrote them (a
 // flush of a mapped range, the runtime's own writes, a write-back of GPU results).
+// 1 when the operating system's write watch is the source (not a test's stand-in) and marks the CPU's writes by itself, so a
+// declared write adds nothing to it.
+int pagegen_watch_is_precise(void);
 uint64_t pagegen_mark(uint64_t lo, uint64_t hi);
 // A mark for a write-back of GPU results into guest memory, called right after the runtime copied them in, on the
 // thread that copied them: every page [lo, hi) touches is stamped as pagegen_mark does, and every page it covers WHOLE is
@@ -68,6 +71,7 @@ uint64_t pagegen_mark_gpu(uint64_t lo, uint64_t hi);
 // the decommit may have come during it (oot2/vk_raw.h, The sinks).
 uint64_t pagegen_mark_gpu_direct(uint64_t lo, uint64_t hi, uint64_t since, uint64_t *cpu_pages);
 uint64_t pagegen_gpu_stamp(uint64_t page);   // the stamp pagegen_mark_gpu gave the page (0: none)
+int pagegen_gpu_ever(uint64_t page);   // 1 when a GPU write-back ever covered the page whole (whether or not the CPU wrote it meanwhile)
 uint64_t pagegen_now(void);   // the newest generation handed out (0 before the first)
 
 // The runs of pages of [lo, hi) stamped after since, in address order: fn(ctx, run_lo, run_hi) for each run of
