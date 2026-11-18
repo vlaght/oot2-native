@@ -7,6 +7,21 @@
 >
 > `oot2 prepare` builds the game from your dump on your machine, so the result contains the game. It is for your own use. Do not share it, and never attach game files, keys, captures or screenshots to an issue or a pull request.
 
+## About this fork (Linux)
+
+This is a fork of [RealZotto/oot2-native](https://github.com/RealZotto/oot2-native) that builds and **runs the game natively on Linux** with the Vulkan back end, and packages it as an AppImage. Details, the list of changes and the limits are in [docs/linux-port.md](docs/linux-port.md).
+
+What differs from upstream:
+
+- **Linux write watch** (userfaultfd in async write-protect mode plus `PAGEMAP_SCAN`, kernel 6.7 or later), so the back end can mirror guest memory in VRAM as it does on Windows
+- **BC7 textures**: ASTC textures are re-encoded on the GPU as BC7 (a quarter of the RGBA8 memory)
+- **Present scaler**: bicubic with sharpening when the window is larger than the picture (`upscaler`, `upscale_sharpness`)
+- **Shader variants translated on demand** by `oot2-xlate` when a pack lacks one
+- **Performance**: gameplay went from 21 fps to a steady 60 fps (the game's vsync cap) on the test machine (see the document for what changed)
+- **AppImage** recipe in [appimage/](appimage/) with a launcher that can switch KDE to 60 Hz and run borderless
+
+Tested on exactly one machine: Bazzite (Fedora Atomic, kernel 7.x), RTX 4070 Ti SUPER, KDE Wayland, 2560x1440. Other distributions and GPUs are untested; read the compatibility section before trying. The notes below this section are upstream's and describe upstream's Windows status.
+
 ## Status
 
 Developer preview. The game is not playable yet, and there is no release yet. `oot2 prepare` builds the program from a dump. The program runs the game's start-up, decodes its start-up movies and reaches the title menu's draws on a null graphics back end, which has no window and shows no picture. The Vulkan back end is built in parts (device, pipelines, the replay of the game's draws and dispatches, texture upload) and tested on a GPU, but it has no window yet and does not draw task and mesh programs or compressed textures, so nothing is shown. The first milestone is the title screen with its movie on the Vulkan back end at 60 fps.

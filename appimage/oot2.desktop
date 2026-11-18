@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=oot2-native
+Comment=Native recompilation of Ocarina of Time (from your own dump)
+Exec=AppRun
+Icon=oot2
+Categories=Game;
+Terminal=false

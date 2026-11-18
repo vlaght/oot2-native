@@ -1,0 +1,71 @@
+#!/bin/sh
+# AppImage entry point. The game data (the folder `oot2 prepare` wrote) is NOT in the image:
+# point OOT2_GAME at it, or put/link it at ~/.local/share/oot2.
+#
+# On KDE the display is switched to 60 Hz for the run and put back afterwards: the game's clock is 60 Hz, and on a
+# 120/144/180 Hz display its pictures are shown for an uneven number of refreshes (visible as stutter), which no
+# driver can fix yet. The game runs borderless at the size of the screen.
+#   OOT2_KEEP_HZ=1    leave the display's refresh rate alone
+#   OOT2_WINDOWED=1   a normal window instead of the full screen
+#   OOT2_GAME=DIR     the game folder
+HERE="$(dirname "$(readlink -f "$0")")"
+GAME="${OOT2_GAME:-${XDG_DATA_HOME:-$HOME/.local/share}/oot2}"
+if [ ! -d "$GAME" ]; then
+    echo "oot2: game folder not found: $GAME" >&2
+    echo "Set OOT2_GAME=/path/to/OUT (the folder 'oot2 prepare' wrote), or link it to ~/.local/share/oot2" >&2
+    exit 1
+fi
+export OOT2_GFX="${OOT2_GFX:-vulkan}"
+# the shader translator, for variants the packs do not hold (translated on demand)
+[ -x "$HERE/usr/bin/oot2-xlate" ] && export OOT2_XLATE="${OOT2_XLATE:-$HERE/usr/bin/oot2-xlate}"
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/oot2"
+STATE="$STATE_DIR/restore-mode"
+KS="$(command -v kscreen-doctor)"
+SWITCHED=""
+
+restore_mode() {   # put the display back: the file holds "OUTPUT MODE_ID"
+    [ -f "$STATE" ] || return 0
+    read -r out id < "$STATE"
+    [ -n "$out" ] && [ -n "$id" ] && "$KS" "output.$out.mode.$id" >/dev/null 2>&1
+    rm -f "$STATE"
+}
+
+switch_to_60() {
+    info="$("$KS" -o 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')"
+    out="$(printf '%s\n' "$info" | awk '/^Output:/{n=$3} /^[ \t]*enabled/{if(n){print n; exit}}')"
+    [ -n "$out" ] || return 0
+    modes="$(printf '%s\n' "$info" | awk -v n="$out" '/^Output:/{c=($3==n)} c && /Modes:/{print; exit}')"
+    cur="$(printf '%s\n' "$modes" | tr ' ' '\n' | grep '\*$' | head -1)"
+    [ -n "$cur" ] || return 0
+    cur_id="${cur%%:*}"
+    res="${cur#*:}"; res="${res%%@*}"
+    rate="${cur#*@}"; rate="${rate%\*}"; rate="${rate%\!}"
+    case "$rate" in 59.*|60.*) return 0 ;; esac   # already 60 Hz
+    want="$(printf '%s\n' "$modes" | tr ' ' '\n' | grep -E "^[0-9]+:${res}@(60\.00|59\.9[0-9])" | sort -t@ -k2 -r | head -1)"
+    [ -n "$want" ] || return 0
+    mkdir -p "$STATE_DIR"
+    echo "$out $cur_id" > "$STATE"
+    "$KS" "output.$out.mode.${want%%:*}" >/dev/null 2>&1 || { rm -f "$STATE"; return 0; }
+    SWITCHED=1
+    sleep 2   # let the display and the compositor settle
+}
+
+if [ -n "$KS" ] && [ -z "$OOT2_KEEP_HZ" ]; then
+    restore_mode   # a run that was killed hard left the display at 60 Hz
+    switch_to_60
+fi
+
+MODE="--set window_mode=borderless"
+[ -n "$OOT2_WINDOWED" ] && MODE=""
+
+# shellcheck disable=SC2086
+"$HERE/usr/bin/oot2" --game "$GAME" $MODE --set frames_in_flight=4 "$@" &
+pid=$!
+trap 'kill $pid 2>/dev/null' INT TERM HUP
+wait $pid
+rc=$?
+trap - INT TERM HUP
+wait $pid 2>/dev/null
+[ -n "$SWITCHED" ] && restore_mode
+exit $rc

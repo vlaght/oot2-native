@@ -91,3 +91,12 @@ venv/
 *.swp
 Thumbs.db
 .DS_Store
+
+# Linux port: local toolchain copies, the prepared game folder and packaging output (the icon is the player's own).
+/OUT/
+/deps/
+/vk/
+/appimage/AppDir/
+/appimage/appimagetool
+/appimage/*.AppImage
+/appimage/oot2.png
